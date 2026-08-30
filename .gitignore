@@ -1,0 +1,13 @@
+# Binaries
+bin/
+*.exe
+*.exe~
+*.test
+# Runtime artifacts
+log/
+wal/
+snap/
+*.out
+# IDE
+.vscode/*
+.idea/
