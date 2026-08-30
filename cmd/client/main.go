@@ -1,16 +1,18 @@
-// client 是分布式文件系统的客户端 CLI 二进制。
+// client is the client CLI binary for the distributed file system.
 //
-// 用法：
-//   ./client -mds=localhost:9000 <command> [args]
+// Usage:
 //
-// 命令：
-//   mkdir <path>                    创建目录
-//   put <local> <remote>            上传文件
-//   get <remote> <local>            下载文件
-//   ls <path>                       列出目录
-//   stat <path>                     查看文件/目录信息
-//   rm <path>                       删除文件/目录
-//   nodes                           列出已注册的数据节点
+//	./client -mds=localhost:9001 <command> [args]
+//
+// Commands:
+//
+//	mkdir <path>                    Create directory
+//	put <local> <remote>            Upload file
+//	get <remote> <local>            Download file
+//	ls [path]                       List directory (default: /)
+//	stat <path>                     Show file/directory info
+//	rm <path>                       Delete file/directory
+//	nodes                           List registered data nodes
 package main
 
 import (
@@ -25,7 +27,7 @@ import (
 )
 
 func main() {
-	mdsAddr := flag.String("mds", "localhost:9000", "metadata server address")
+	mdsAddr := flag.String("mds", "localhost:9001", "metadata server address")
 	flag.Parse()
 
 	args := flag.Args()
@@ -34,6 +36,7 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Structured logging
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 

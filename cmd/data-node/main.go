@@ -1,9 +1,10 @@
-// data-node 是分布式文件系统的数据节点二进制。
+// data-node is the data node binary for the distributed file system.
 //
-// 用法：
-//   ./data-node -addr=:9001 -mds=localhost:9000 -data-dir=/tmp/dn1
+// Usage:
 //
-// 职责：存储实际文件内容，启动时向 MDS 注册自己。
+//	./data-node -addr=:9101 -mds=localhost:9001 -data-dir=/tmp/dn1
+//
+// Responsibility: stores actual file content and registers itself with MDS on startup.
 package main
 
 import (
@@ -20,29 +21,29 @@ import (
 )
 
 func main() {
-	addr := flag.String("addr", ":9001", "RPC listen address")
-	mdsAddr := flag.String("mds", "localhost:9000", "metadata server address")
+	addr := flag.String("addr", ":9101", "RPC listen address")
+	mdsAddr := flag.String("mds", "localhost:9001", "metadata server address")
 	dataDir := flag.String("data-dir", "/tmp/dn1", "local data directory")
 	flag.Parse()
 
-	// 结构化日志
+	// Structured logging
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 
-	// 创建数据节点
+	// Create the data node
 	dn, err := datanode.NewDataNode(*dataDir, *mdsAddr, *addr, logger)
 	if err != nil {
 		logger.Error("failed to create data node", "error", err)
 		os.Exit(1)
 	}
 
-	// 注册 RPC 服务
+	// Register RPC service
 	if err := dn.RegisterRPC(); err != nil {
 		logger.Error("failed to register RPC", "error", err)
 		os.Exit(1)
 	}
 
-	// 启动 TCP 监听
+	// Start TCP listener
 	listener, err := net.Listen("tcp", *addr)
 	if err != nil {
 		logger.Error("failed to listen", "addr", *addr, "error", err)
@@ -51,7 +52,7 @@ func main() {
 	logger.Info("data node starting", "addr", *addr, "mds", *mdsAddr, "data_dir", *dataDir)
 	fmt.Printf("Data Node listening on %s\n", *addr)
 
-	// 向 MDS 注册自己（重试几次，MDS 可能还没启动）
+	// Register with MDS (retry a few times in case MDS is not started yet)
 	go func() {
 		for i := 0; i < 5; i++ {
 			if err := dn.RegisterToMDS(); err != nil {
@@ -63,7 +64,7 @@ func main() {
 		logger.Error("failed to register to MDS after 5 attempts")
 	}()
 
-	// 优雅退出
+	// Graceful shutdown
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
