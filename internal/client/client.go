@@ -90,17 +90,19 @@ func (c *Client) Mkdir(path string) error {
 	return nil
 }
 
-// PutFile 上传本地文件到分布式文件系统。
-// 流程：读本地文件 → RPC MDS 创建元数据（拿数据节点地址）→ RPC DataNode 存内容。
+// PutFile uploads a local file to the distributed file system.
+// Flow: read local file → RPC MDS create metadata (get all replica locations) →
+//
+//	parallel RPC to all DataNodes to store content.
 func (c *Client) PutFile(localPath, remotePath string) error {
-	// 1. 读本地文件
+	// 1. Read local file
 	content, err := os.ReadFile(localPath)
 	if err != nil {
 		return fmt.Errorf("read local file failed: %w", err)
 	}
 	c.logger.Info("local file read", "local", localPath, "size", len(content))
 
-	// 2. RPC MDS 创建文件元数据，拿到数据节点地址（自动重定向到 leader）
+	// 2. RPC MDS create file metadata, get all replica locations (auto-redirect to leader)
 	createArgs := &types.CreateFileArgs{
 		Path:    remotePath,
 		Size:    int64(len(content)),
@@ -110,32 +112,61 @@ func (c *Client) PutFile(localPath, remotePath string) error {
 	if err := c.callMDSWithRedirect("MetadataService.CreateFile", createArgs, &createReply); err != nil {
 		return fmt.Errorf("create metadata failed: %w", err)
 	}
-	c.logger.Info("metadata created, assigned to data node", "path", remotePath, "data_node", createReply.DataNodeAddr)
+	c.logger.Info("metadata created, replicas assigned", "path", remotePath, "replicas", len(createReply.Replicas))
 
-	// 3. RPC DataNode 存内容
-	dn, err := c.dialDataNode(createReply.DataNodeAddr)
-	if err != nil {
-		return err
+	// 3. Store content to all replica DataNodes in parallel
+	type storeResult struct {
+		addr string
+		err  error
 	}
-	defer dn.Close()
+	resultCh := make(chan storeResult, len(createReply.Replicas))
+	for _, replica := range createReply.Replicas {
+		go func(r types.Replica) {
+			dn, err := c.dialDataNode(r.Addr)
+			if err != nil {
+				resultCh <- storeResult{addr: r.Addr, err: err}
+				return
+			}
+			defer dn.Close()
 
-	storeArgs := &types.StoreArgs{
-		Path:    createReply.RemotePath,
-		Content: content,
-	}
-	var storeReply bool
-	if err := dn.Call("DataService.StoreData", storeArgs, &storeReply); err != nil {
-		return fmt.Errorf("store data failed: %w", err)
+			storeArgs := &types.StoreArgs{
+				Path:    r.RemotePath,
+				Content: content,
+			}
+			var storeReply bool
+			if err := dn.Call("DataService.StoreData", storeArgs, &storeReply); err != nil {
+				resultCh <- storeResult{addr: r.Addr, err: fmt.Errorf("store data failed: %w", err)}
+				return
+			}
+			resultCh <- storeResult{addr: r.Addr, err: nil}
+		}(replica)
 	}
 
-	c.logger.Info("file uploaded", "remote", remotePath, "size", len(content), "data_node", createReply.DataNodeAddr)
+	// Wait for all stores, count successes
+	successCount := 0
+	var firstErr error
+	for i := 0; i < len(createReply.Replicas); i++ {
+		result := <-resultCh
+		if result.err == nil {
+			successCount++
+		} else if firstErr == nil {
+			firstErr = result.err
+		}
+	}
+
+	// Need at least one successful replica
+	if successCount == 0 {
+		return fmt.Errorf("all %d replica stores failed: %w", len(createReply.Replicas), firstErr)
+	}
+
+	c.logger.Info("file uploaded", "remote", remotePath, "size", len(content), "replicas_ok", successCount, "replicas_total", len(createReply.Replicas))
 	return nil
 }
 
-// GetFile 从分布式文件系统下载文件到本地。
-// 流程：RPC MDS 拿位置 → RPC DataNode 读内容 → 写本地文件。
+// GetFile downloads a file from the distributed file system to local.
+// Flow: RPC MDS get all replica locations → try each DataNode in order until one succeeds → write local file.
 func (c *Client) GetFile(remotePath, localPath string) error {
-	// 1. RPC MDS 查询文件位置
+	// 1. RPC MDS query file locations
 	mds, err := c.dialMDS()
 	if err != nil {
 		return err
@@ -146,21 +177,35 @@ func (c *Client) GetFile(remotePath, localPath string) error {
 	if err := mds.Call("MetadataService.GetFileLocation", remotePath, &loc); err != nil {
 		return fmt.Errorf("get file location failed: %w", err)
 	}
-	c.logger.Info("file location resolved", "remote", remotePath, "data_node", loc.DataNodeAddr)
+	c.logger.Info("file locations resolved", "remote", remotePath, "replicas", len(loc.Replicas))
 
-	// 2. RPC DataNode 读内容
-	dn, err := c.dialDataNode(loc.DataNodeAddr)
-	if err != nil {
-		return err
-	}
-	defer dn.Close()
-
+	// 2. Try each replica in order until one succeeds
 	var content []byte
-	if err := dn.Call("DataService.GetData", loc.RemotePath, &content); err != nil {
-		return fmt.Errorf("get data failed: %w", err)
+	var lastErr error
+	for _, replica := range loc.Replicas {
+		dn, err := c.dialDataNode(replica.Addr)
+		if err != nil {
+			lastErr = err
+			c.logger.Warn("failed to connect to replica, trying next", "data_node", replica.Addr, "error", err)
+			continue
+		}
+
+		var replicaContent []byte
+		if err := dn.Call("DataService.GetData", replica.RemotePath, &replicaContent); err != nil {
+			lastErr = err
+			c.logger.Warn("failed to read from replica, trying next", "data_node", replica.Addr, "error", err)
+			dn.Close()
+			continue
+		}
+		dn.Close()
+		content = replicaContent
+		break
+	}
+	if content == nil {
+		return fmt.Errorf("all %d replicas failed, last error: %w", len(loc.Replicas), lastErr)
 	}
 
-	// 3. 写本地文件
+	// 3. Write local file
 	if err := os.WriteFile(localPath, content, 0644); err != nil {
 		return fmt.Errorf("write local file failed: %w", err)
 	}
@@ -199,33 +244,50 @@ func (c *Client) Stat(path string) (*types.FileInfo, error) {
 	return &info, nil
 }
 
-// Delete 删除文件或目录。
-// 如果是文件，还会通知对应数据节点清理内容。
+// Delete removes a file or directory.
+// If it's a file, also notifies all replica DataNodes to clean up content.
 func (c *Client) Delete(path string) error {
 	var reply types.DeleteReply
 	if err := c.callMDSWithRedirect("MetadataService.Delete", path, &reply); err != nil {
 		return fmt.Errorf("delete metadata failed: %w", err)
 	}
 
-	// 如果是文件，通知数据节点清理内容
-	if !reply.IsDir && reply.DataNodeAddr != "" {
-		dn, err := c.dialDataNode(reply.DataNodeAddr)
-		if err != nil {
-			c.logger.Warn("failed to connect to data node for cleanup, will retry later", "data_node", reply.DataNodeAddr, "error", err)
-			return nil // 元数据已删，数据节点清理失败不阻塞
-		}
-		defer dn.Close()
+	// If it's a file, notify all replica DataNodes to clean up content
+	if !reply.IsDir && len(reply.Replicas) > 0 {
+		for _, replica := range reply.Replicas {
+			dn, err := c.dialDataNode(replica.Addr)
+			if err != nil {
+				c.logger.Warn("failed to connect to replica for cleanup", "data_node", replica.Addr, "error", err)
+				continue // metadata already deleted, cleanup failure is non-blocking
+			}
 
-		var dnReply bool
-		if err := dn.Call("DataService.DeleteData", reply.RemotePath, &dnReply); err != nil {
-			c.logger.Warn("failed to delete data from data node", "data_node", reply.DataNodeAddr, "error", err)
-		} else {
-			c.logger.Info("data cleaned on data node", "data_node", reply.DataNodeAddr)
+			var dnReply bool
+			if err := dn.Call("DataService.DeleteData", replica.RemotePath, &dnReply); err != nil {
+				c.logger.Warn("failed to delete data from replica", "data_node", replica.Addr, "error", err)
+			} else {
+				c.logger.Info("data cleaned on replica", "data_node", replica.Addr)
+			}
+			dn.Close()
 		}
 	}
 
 	c.logger.Info("path deleted", "path", path)
 	return nil
+}
+
+// GetReplicas queries and returns all replica locations for a file.
+func (c *Client) GetReplicas(path string) ([]types.Replica, error) {
+	mds, err := c.dialMDS()
+	if err != nil {
+		return nil, err
+	}
+	defer mds.Close()
+
+	var loc types.FileLocation
+	if err := mds.Call("MetadataService.GetFileLocation", path, &loc); err != nil {
+		return nil, fmt.Errorf("get file location failed: %w", err)
+	}
+	return loc.Replicas, nil
 }
 
 // ListDataNodes 列出所有已注册的数据节点。

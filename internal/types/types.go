@@ -1,9 +1,10 @@
 // Package types 定义三个分布式组件共享的数据结构和 RPC 接口。
 //
 // 架构总览：
-//   Client ──RPC──▶ MetadataServer（管目录树 + 文件→数据节点映射）
-//   Client ──RPC──▶ DataNode（存实际文件内容）
-//   DataNode ──RPC──▶ MetadataServer（启动时注册自己）
+//
+//	Client ──RPC──▶ MetadataServer（管目录树 + 文件→数据节点映射）
+//	Client ──RPC──▶ DataNode（存实际文件内容）
+//	DataNode ──RPC──▶ MetadataServer（启动时注册自己）
 package types
 
 import "time"
@@ -19,10 +20,15 @@ type FileInfo struct {
 	ModTime   time.Time `json:"mod_time"`
 }
 
-// FileLocation 描述文件内容存储在哪个数据节点上。
+// Replica describes one copy of a file on a specific data node.
+type Replica struct {
+	Addr       string `json:"addr"`        // data node RPC address
+	RemotePath string `json:"remote_path"` // storage path on that data node
+}
+
+// FileLocation describes where all replicas of a file are stored.
 type FileLocation struct {
-	DataNodeAddr string `json:"data_node_addr"` // 数据节点的 RPC 地址
-	RemotePath   string `json:"remote_path"`    // 在数据节点上的存储路径
+	Replicas []Replica `json:"replicas"` // all replica locations
 }
 
 // ===== MetadataServer RPC 接口定义 =====
@@ -35,10 +41,10 @@ type MetadataService interface {
 	// Mkdir 创建目录。
 	Mkdir(path string, reply *bool) error
 
-	// CreateFile 创建文件元数据，MDS 会选择一个数据节点分配，返回该节点地址。
+	// CreateFile 创建文件元数据，MDS 会选择多个数据节点分配多副本，返回副本位置。
 	CreateFile(args *CreateFileArgs, reply *CreateFileReply) error
 
-	// GetFileLocation 查询文件内容存储在哪个数据节点。
+	// GetFileLocation 查询文件内容存储在哪些数据节点。
 	GetFileLocation(path string, reply *FileLocation) error
 
 	// ListDir 列出目录下的文件和子目录。
@@ -61,17 +67,15 @@ type CreateFileArgs struct {
 	Content string `json:"content_type"` // MIME 类型
 }
 
-// CreateFileReply 创建文件的响应，包含 MDS 分配的数据节点地址。
+// CreateFileReply is the response for creating a file, containing all assigned replica locations.
 type CreateFileReply struct {
-	DataNodeAddr string `json:"data_node_addr"`
-	RemotePath   string `json:"remote_path"`
+	Replicas []Replica `json:"replicas"`
 }
 
-// DeleteReply 删除操作的响应，包含需要通知清理的数据节点。
+// DeleteReply is the response for a delete operation, containing all replica locations to clean up.
 type DeleteReply struct {
-	DataNodeAddr string `json:"data_node_addr"`
-	RemotePath   string `json:"remote_path"`
-	IsDir        bool   `json:"is_dir"`
+	Replicas []Replica `json:"replicas"`
+	IsDir    bool      `json:"is_dir"`
 }
 
 // ===== DataNode RPC 接口定义 =====

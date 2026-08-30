@@ -12,6 +12,7 @@
 //	ls [path]                       List directory (default: /)
 //	stat <path>                     Show file/directory info
 //	rm <path>                       Delete file/directory
+//	replicas <path>                 Show file's replica locations
 //	nodes                           List registered data nodes
 package main
 
@@ -43,6 +44,7 @@ func main() {
 	c := client.NewClient(*mdsAddr, logger)
 
 	cmd := args[0]
+
 	switch cmd {
 	case "mkdir":
 		if len(args) < 2 {
@@ -130,6 +132,24 @@ func main() {
 		}
 		fmt.Printf("✓ Path deleted: %s\n", args[1])
 
+	case "replicas":
+		if len(args) < 2 {
+			fmt.Println("Usage: client replicas <path>")
+			os.Exit(1)
+		}
+		replicas, err := c.GetReplicas(args[1])
+		if err != nil {
+			logger.Error("replicas failed", "error", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Replicas for %s (%d total):\n", args[1], len(replicas))
+		w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+		fmt.Fprintln(w, "#\tDATA NODE\tREMOTE PATH")
+		for i, r := range replicas {
+			fmt.Fprintf(w, "%d\t%s\t%s\n", i+1, r.Addr, r.RemotePath)
+		}
+		w.Flush()
+
 	case "nodes":
 		nodes, err := c.ListDataNodes()
 		if err != nil {
@@ -160,5 +180,6 @@ func printUsage() {
 	fmt.Println("  ls [path]                       List directory (default: /)")
 	fmt.Println("  stat <path>                     Show file/directory info")
 	fmt.Println("  rm <path>                       Delete file/directory")
+	fmt.Println("  replicas <path>                 Show file's replica locations")
 	fmt.Println("  nodes                           List registered data nodes")
 }

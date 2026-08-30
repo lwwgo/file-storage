@@ -103,6 +103,9 @@ echo -n "FAKE_PNG_DATA_123456" > "$DATA_ROOT/test-image.bin"
 "$BIN_DIR/client" -mds="$MDS" put "$DATA_ROOT/test-upload.txt" /docs/readme.md
 "$BIN_DIR/client" -mds="$MDS" put "$DATA_ROOT/test-image.bin" /images/logo.png
 
+# Give Raft time to replicate logs to followers before read tests
+sleep 2
+
 # 4. 列出目录
 echo ""
 log "4. List root directory"
@@ -117,27 +120,44 @@ echo ""
 log "6. Stat a file"
 "$BIN_DIR/client" -mds="$MDS" stat /docs/readme.md
 
-# 6. 下载
+# 6. 查看副本分布
 echo ""
-log "7. Download file"
+log "7. Show replica locations for /docs/readme.md"
+"$BIN_DIR/client" -mds="$MDS" replicas /docs/readme.md
+
+# 7. 下载
+echo ""
+log "8. Download file"
 "$BIN_DIR/client" -mds="$MDS" get /docs/readme.md "$DATA_ROOT/downloaded.txt"
 echo "   Downloaded content: $(cat "$DATA_ROOT/downloaded.txt")"
 
-# 7. 物理分布
+# 8. 物理分布（验证文件存在于多个 DataNode）
 echo ""
-log "8. Physical distribution across data nodes"
-echo "   DataNode1 files: $(find "$DATA_ROOT/dn1" -type f 2>/dev/null | sed "s|$DATA_ROOT/dn1/||" | tr '\n' ' ')"
-echo "   DataNode2 files: $(find "$DATA_ROOT/dn2" -type f 2>/dev/null | sed "s|$DATA_ROOT/dn2/||" | tr '\n' ' ')"
+log "9. Physical distribution across data nodes (multi-replica verification)"
+DN1_FILES=$(find "$DATA_ROOT/dn1" -type f 2>/dev/null | sed "s|$DATA_ROOT/dn1/||" | tr '\n' ' ')
+DN2_FILES=$(find "$DATA_ROOT/dn2" -type f 2>/dev/null | sed "s|$DATA_ROOT/dn2/||" | tr '\n' ' ')
+echo "   DataNode1 files: $DN1_FILES"
+echo "   DataNode2 files: $DN2_FILES"
+# 验证 readme.md 至少存在于 2 个节点（多副本）
+REPLICA_COUNT=0
+[[ "$DN1_FILES" == *readme.md* ]] && REPLICA_COUNT=$((REPLICA_COUNT+1))
+[[ "$DN2_FILES" == *readme.md* ]] && REPLICA_COUNT=$((REPLICA_COUNT+1))
+if [[ $REPLICA_COUNT -ge 2 ]]; then
+    success "readme.md found on $REPLICA_COUNT data nodes (multi-replica OK)"
+else
+    warn "readme.md only found on $REPLICA_COUNT data node(s)"
+fi
 
-# 8. 删除
+# 10. 删除
 echo ""
-log "9. Delete a file"
+log "10. Delete a file"
 "$BIN_DIR/client" -mds="$MDS" rm /images/logo.png
+sleep 1
 "$BIN_DIR/client" -mds="$MDS" ls /images
 
-# 9. 验证从不同 MDS 节点读（follower 也能读）
+# 11. 验证从不同 MDS 节点读（follower 也能读）
 echo ""
-log "10. Read from different MDS node (localhost:9002, should also work)"
+log "11. Read from different MDS node (localhost:9002, should also work)"
 "$BIN_DIR/client" -mds=localhost:9002 ls /docs
 
 echo ""

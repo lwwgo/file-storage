@@ -34,20 +34,19 @@ const (
 	OpDelete           = "delete"
 )
 
-// commandPayload 是 Raft 日志条目中承载的业务命令载荷。
-// 所有字段通过 JSON 序列化后存入 CommandEntry.Data，
-// 保证所有副本以相同顺序应用相同命令，达到状态机一致。
+// commandPayload is the business command payload carried in a Raft log entry.
+// All fields are JSON-serialized into CommandEntry.Data, ensuring all replicas
+// apply the same commands in the same order for state machine consistency.
 type commandPayload struct {
-	Op           string `json:"op"`
-	Path         string `json:"path,omitempty"`
-	Addr         string `json:"addr,omitempty"`           // register_dn: 数据节点地址
-	Size         int64  `json:"size,omitempty"`           // create_file: 文件大小
-	DataNodeAddr string `json:"data_node_addr,omitempty"` // create_file 选中的 / delete 目标所在的
-	RemotePath   string `json:"remote_path,omitempty"`    // create_file/delete: 数据节点上的路径
-	IsDir        bool   `json:"is_dir,omitempty"`         // delete: 目标是否为目录
+	Op       string          `json:"op"`
+	Path     string          `json:"path,omitempty"`
+	Addr     string          `json:"addr,omitempty"` // register_dn: data node address
+	Size     int64           `json:"size,omitempty"` // create_file: file size
+	Replicas []types.Replica `json:"replicas,omitempty"`
+	IsDir    bool            `json:"is_dir,omitempty"` // delete: whether the target is a directory
 }
 
-// entry 是目录树中的一个节点（文件或目录）。
+// entry is a node in the directory tree (file or directory).
 type entry struct {
 	name      string
 	isDir     bool
@@ -56,23 +55,23 @@ type entry struct {
 	createdAt time.Time
 	modTime   time.Time
 
-	// 仅文件节点使用：指向数据节点的映射
-	dataNodeAddr string
-	remotePath   string
+	// Only for file nodes: replica locations on data nodes
+	replicas []types.Replica
 
-	// 仅目录节点使用：子节点
+	// Only for directory nodes: child nodes
 	children map[string]*entry
 }
 
-// MetadataServer 是元数据服务器的核心实现。
-// 它同时是 goraft 的 StateMachine 实现：Raft 负责日志复制，
-// MetadataServer 负责把日志应用到目录树状态机。
+// MetadataServer is the core implementation of the metadata server.
+// It also implements goraft's StateMachine interface: Raft handles log replication,
+// while MetadataServer applies logs to the directory tree state machine.
 type MetadataServer struct {
-	mu         sync.RWMutex
-	root       *entry   // 根目录
-	dataNodes  []string // 已注册的数据节点列表
-	raftServer *raft.Server
-	logger     *slog.Logger
+	mu           sync.RWMutex
+	root         *entry   // root directory
+	dataNodes    []string // registered data node addresses
+	raftServer   *raft.Server
+	logger       *slog.Logger
+	replicaCount int // desired number of replicas per file (default 3)
 }
 
 // NewMetadataServer 创建并启动集成了 Raft 的元数据服务器。
@@ -90,8 +89,9 @@ func NewMetadataServer(raftConfig rafttypes.Config, logger *slog.Logger) (*Metad
 			modTime:   time.Now(),
 			children:  make(map[string]*entry),
 		},
-		dataNodes: make([]string, 0),
-		logger:    logger,
+		dataNodes:    make([]string, 0),
+		logger:       logger,
+		replicaCount: 3, // default: 3 replicas per file
 	}
 
 	// 把 mds 作为 StateMachine 注入 Raft
@@ -196,13 +196,13 @@ func (mds *MetadataServer) Mkdir(path string, reply *bool) error {
 	return nil
 }
 
-// CreateFile 创建文件元数据，MDS 选择一个数据节点分配。
+// CreateFile creates file metadata. MDS selects multiple data nodes for replication.
 func (mds *MetadataServer) CreateFile(args *types.CreateFileArgs, reply *types.CreateFileReply) error {
 	if err := mds.checkLeader(); err != nil {
 		return err
 	}
 
-	// 预验证：检查数据节点可用 + 父目录存在 + 选数据节点
+	// Pre-validate: data nodes available + parent dir exists + select replica nodes
 	mds.mu.RLock()
 	if len(mds.dataNodes) == 0 {
 		mds.mu.RUnlock()
@@ -223,34 +223,31 @@ func (mds *MetadataServer) CreateFile(args *types.CreateFileArgs, reply *types.C
 		}
 		current = child
 	}
-	selectedAddr := mds.selectDataNode(args.Path)
-	remotePath := args.Path
+	replicas := mds.selectDataNodes(args.Path, mds.replicaCount)
 	mds.mu.RUnlock()
 
 	payload := &commandPayload{
-		Op:           OpCreateFile,
-		Path:         args.Path,
-		Size:         args.Size,
-		DataNodeAddr: selectedAddr,
-		RemotePath:   remotePath,
+		Op:       OpCreateFile,
+		Path:     args.Path,
+		Size:     args.Size,
+		Replicas: replicas,
 	}
 	if err := mds.submitCommand(payload); err != nil {
 		return err
 	}
 
-	reply.DataNodeAddr = selectedAddr
-	reply.RemotePath = remotePath
-	mds.logger.Info("file metadata created via raft", "path", args.Path, "data_node", selectedAddr)
+	reply.Replicas = replicas
+	mds.logger.Info("file metadata created via raft", "path", args.Path, "replicas", len(replicas))
 	return nil
 }
 
-// Delete 删除文件或目录。
+// Delete removes a file or directory.
 func (mds *MetadataServer) Delete(path string, reply *types.DeleteReply) error {
 	if err := mds.checkLeader(); err != nil {
 		return err
 	}
 
-	// 预查找目标，取出需要返回给客户端的清理信息
+	// Pre-lookup the target to get replica cleanup info for the client
 	mds.mu.RLock()
 	target := mds.lookup(path)
 	if target == nil {
@@ -258,11 +255,10 @@ func (mds *MetadataServer) Delete(path string, reply *types.DeleteReply) error {
 		return fmt.Errorf("path not found: %s", path)
 	}
 	payload := &commandPayload{
-		Op:           OpDelete,
-		Path:         path,
-		IsDir:        target.isDir,
-		DataNodeAddr: target.dataNodeAddr,
-		RemotePath:   target.remotePath,
+		Op:       OpDelete,
+		Path:     path,
+		IsDir:    target.isDir,
+		Replicas: target.replicas,
 	}
 	mds.mu.RUnlock()
 
@@ -271,15 +267,14 @@ func (mds *MetadataServer) Delete(path string, reply *types.DeleteReply) error {
 	}
 
 	reply.IsDir = payload.IsDir
-	reply.DataNodeAddr = payload.DataNodeAddr
-	reply.RemotePath = payload.RemotePath
+	reply.Replicas = payload.Replicas
 	mds.logger.Info("path deleted via raft", "path", path, "is_dir", payload.IsDir)
 	return nil
 }
 
-// ===== 读操作（所有节点都可处理，直接读本地状态机）=====
+// ===== Read operations (any node can serve; reads local state machine) =====
 
-// GetFileLocation 查询文件内容在哪个数据节点。
+// GetFileLocation queries where all replicas of a file are stored.
 func (mds *MetadataServer) GetFileLocation(path string, reply *types.FileLocation) error {
 	mds.mu.RLock()
 	defer mds.mu.RUnlock()
@@ -291,8 +286,7 @@ func (mds *MetadataServer) GetFileLocation(path string, reply *types.FileLocatio
 	if e.isDir {
 		return fmt.Errorf("%s is a directory", path)
 	}
-	reply.DataNodeAddr = e.dataNodeAddr
-	reply.RemotePath = e.remotePath
+	reply.Replicas = e.replicas
 	return nil
 }
 
@@ -352,7 +346,7 @@ func (mds *MetadataServer) Stat(path string, reply *types.FileInfo) error {
 	return nil
 }
 
-// ListDataNodes 列出已注册的数据节点。
+// ListDataNodes 列出所有已注册的数据节点。
 func (mds *MetadataServer) ListDataNodes(_ struct{}, reply *[]string) error {
 	mds.mu.RLock()
 	defer mds.mu.RUnlock()
@@ -471,14 +465,13 @@ func (mds *MetadataServer) applyCreateFile(p *commandPayload) error {
 
 	now := time.Now()
 	current.children[fileName] = &entry{
-		name:         fileName,
-		isDir:        false,
-		size:         p.Size,
-		mode:         0644,
-		createdAt:    now,
-		modTime:      now,
-		dataNodeAddr: p.DataNodeAddr,
-		remotePath:   p.RemotePath,
+		name:      fileName,
+		isDir:     false,
+		size:      p.Size,
+		mode:      0644,
+		createdAt: now,
+		modTime:   now,
+		replicas:  p.Replicas,
 	}
 	current.modTime = now
 	return nil
@@ -540,17 +533,42 @@ func (mds *MetadataServer) lookup(path string) *entry {
 	return current
 }
 
-// selectDataNode 轮询选择一个数据节点（简单哈希取模）。
-func (mds *MetadataServer) selectDataNode(path string) string {
+// selectDataNodes selects N distinct data nodes for a file's replicas.
+// Uses hash-based assignment to spread files deterministically across nodes.
+func (mds *MetadataServer) selectDataNodes(path string, replicaCount int) []types.Replica {
+	n := replicaCount
+	if n > len(mds.dataNodes) {
+		n = len(mds.dataNodes)
+	}
+	if n < 1 {
+		n = 1
+	}
+
+	// Deterministic hash to pick the first node, then rotate for diversity
 	hash := 0
 	for _, c := range path {
 		hash = hash*31 + int(c)
 	}
-	idx := hash % len(mds.dataNodes)
-	if idx < 0 {
-		idx = -idx
+	startIdx := hash % len(mds.dataNodes)
+	if startIdx < 0 {
+		startIdx = -startIdx
 	}
-	return mds.dataNodes[idx]
+
+	replicas := make([]types.Replica, 0, n)
+	seen := make(map[string]bool)
+	for i := 0; i < n; i++ {
+		idx := (startIdx + i) % len(mds.dataNodes)
+		addr := mds.dataNodes[idx]
+		if seen[addr] {
+			continue
+		}
+		seen[addr] = true
+		replicas = append(replicas, types.Replica{
+			Addr:       addr,
+			RemotePath: path,
+		})
+	}
+	return replicas
 }
 
 // ===== JSON 序列化辅助结构（Snapshot/Restore 用）=====
@@ -573,27 +591,25 @@ func (s *metaSnapshot) toEntry() *entry {
 }
 
 type entrySnapshot struct {
-	Name         string                    `json:"name"`
-	IsDir        bool                      `json:"is_dir"`
-	Size         int64                     `json:"size"`
-	Mode         uint32                    `json:"mode"`
-	CreatedAt    time.Time                 `json:"created_at"`
-	ModTime      time.Time                 `json:"mod_time"`
-	DataNodeAddr string                    `json:"data_node_addr,omitempty"`
-	RemotePath   string                    `json:"remote_path,omitempty"`
-	Children     map[string]*entrySnapshot `json:"children,omitempty"`
+	Name      string                    `json:"name"`
+	IsDir     bool                      `json:"is_dir"`
+	Size      int64                     `json:"size"`
+	Mode      uint32                    `json:"mode"`
+	CreatedAt time.Time                 `json:"created_at"`
+	ModTime   time.Time                 `json:"mod_time"`
+	Replicas  []types.Replica           `json:"replicas,omitempty"`
+	Children  map[string]*entrySnapshot `json:"children,omitempty"`
 }
 
 func (e *entry) toSnapshot() *entrySnapshot {
 	s := &entrySnapshot{
-		Name:         e.name,
-		IsDir:        e.isDir,
-		Size:         e.size,
-		Mode:         e.mode,
-		CreatedAt:    e.createdAt,
-		ModTime:      e.modTime,
-		DataNodeAddr: e.dataNodeAddr,
-		RemotePath:   e.remotePath,
+		Name:      e.name,
+		IsDir:     e.isDir,
+		Size:      e.size,
+		Mode:      e.mode,
+		CreatedAt: e.createdAt,
+		ModTime:   e.modTime,
+		Replicas:  e.replicas,
 	}
 	if e.isDir {
 		s.Children = make(map[string]*entrySnapshot)
@@ -606,14 +622,13 @@ func (e *entry) toSnapshot() *entrySnapshot {
 
 func (s *entrySnapshot) toEntry() *entry {
 	e := &entry{
-		name:         s.Name,
-		isDir:        s.IsDir,
-		size:         s.Size,
-		mode:         s.Mode,
-		createdAt:    s.CreatedAt,
-		modTime:      s.ModTime,
-		dataNodeAddr: s.DataNodeAddr,
-		remotePath:   s.RemotePath,
+		name:      s.Name,
+		isDir:     s.IsDir,
+		size:      s.Size,
+		mode:      s.Mode,
+		createdAt: s.CreatedAt,
+		modTime:   s.ModTime,
+		replicas:  s.Replicas,
 	}
 	if s.IsDir {
 		e.children = make(map[string]*entry)
