@@ -12,6 +12,8 @@
 package metadata
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -34,6 +36,8 @@ const (
 	OpCreateFile     = "create_file"
 	OpCompleteFile   = "complete_file"
 	OpDelete         = "delete"
+	OpRename         = "rename"
+	OpUpdateSize     = "update_size"
 )
 
 // 文件状态（仅文件节点有效）
@@ -53,6 +57,9 @@ type commandPayload struct {
 	Replicas   []types.Replica  `json:"replicas,omitempty"`
 	IsDir      bool             `json:"is_dir,omitempty"`      // delete: whether the target is a directory
 	CreateMode types.CreateMode `json:"create_mode,omitempty"` // create_file: behavior when file exists
+	FileID     string           `json:"file_id,omitempty"`     // create_file: stable object identity (inode equivalent)
+	DstPath    string           `json:"dst_path,omitempty"`    // rename: destination path
+	NewSize    int64            `json:"new_size,omitempty"`    // update_size: new file size
 }
 
 // entry is a node in the directory tree (file or directory).
@@ -64,6 +71,7 @@ type entry struct {
 	createdAt time.Time
 	modTime   time.Time
 	status    string // only for file nodes: "pending" or "complete"
+	fileID    string // only for file nodes: stable object identity (inode equivalent)
 
 	// Only for file nodes: replica locations on data nodes
 	replicas []types.Replica
@@ -218,6 +226,10 @@ func (mds *MetadataServer) CreateFile(args *types.CreateFileArgs, reply *types.C
 	}
 
 	// Pre-validate: data nodes available + parent dir exists + select replica nodes
+	fileID, err := generateFileID()
+	if err != nil {
+		return fmt.Errorf("generate file id failed: %w", err)
+	}
 	mds.mu.RLock()
 	if len(mds.dataNodes) == 0 {
 		mds.mu.RUnlock()
@@ -238,7 +250,7 @@ func (mds *MetadataServer) CreateFile(args *types.CreateFileArgs, reply *types.C
 		}
 		current = child
 	}
-	replicas := mds.selectDataNodes(args.Path, mds.replicaCount)
+	replicas := mds.selectDataNodes(args.Path, fileID, mds.replicaCount)
 	mds.mu.RUnlock()
 
 	payload := &commandPayload{
@@ -247,6 +259,7 @@ func (mds *MetadataServer) CreateFile(args *types.CreateFileArgs, reply *types.C
 		Size:       args.Size,
 		Replicas:   replicas,
 		CreateMode: args.CreateMode,
+		FileID:     fileID,
 	}
 	if err := mds.submitCommand(payload); err != nil {
 		return err
@@ -302,6 +315,62 @@ func (mds *MetadataServer) Delete(path string, reply *types.DeleteReply) error {
 	return nil
 }
 
+// Rename renames/moves a file or directory. FileID stays unchanged (inode identity preserved).
+// Atomic: the whole operation is a single Raft log entry.
+func (mds *MetadataServer) Rename(args *types.RenameArgs, reply *bool) error {
+	if err := mds.checkLeader(); err != nil {
+		return err
+	}
+	if args.SrcPath == "" || args.DstPath == "" {
+		return fmt.Errorf("src_path and dst_path must not be empty")
+	}
+	if args.SrcPath == "/" || args.DstPath == "/" {
+		return fmt.Errorf("cannot rename root")
+	}
+	if args.SrcPath == args.DstPath {
+		*reply = true
+		return nil
+	}
+
+	payload := &commandPayload{
+		Op:      OpRename,
+		Path:    args.SrcPath,
+		DstPath: args.DstPath,
+	}
+	if err := mds.submitCommand(payload); err != nil {
+		return err
+	}
+	*reply = true
+	mds.logger.Info("path renamed via raft", "src", args.SrcPath, "dst", args.DstPath)
+	return nil
+}
+
+// UpdateSize updates a file's size metadata after a successful write.
+// Only changes size + modTime; does not touch replicas or FileID.
+func (mds *MetadataServer) UpdateSize(args *types.UpdateSizeArgs, reply *bool) error {
+	if err := mds.checkLeader(); err != nil {
+		return err
+	}
+	if args.Path == "" {
+		return fmt.Errorf("path must not be empty")
+	}
+	if args.Size < 0 {
+		return fmt.Errorf("size must not be negative")
+	}
+
+	payload := &commandPayload{
+		Op:      OpUpdateSize,
+		Path:    args.Path,
+		NewSize: args.Size,
+	}
+	if err := mds.submitCommand(payload); err != nil {
+		return err
+	}
+	*reply = true
+	mds.logger.Debug("file size updated via raft", "path", args.Path, "size", args.Size)
+	return nil
+}
+
 // ===== Read operations (any node can serve; reads local state machine) =====
 
 // GetFileLocation queries where all replicas of a file are stored.
@@ -316,6 +385,7 @@ func (mds *MetadataServer) GetFileLocation(path string, reply *types.FileLocatio
 	if e.isDir {
 		return fmt.Errorf("%s is a directory", path)
 	}
+	reply.FileID = e.fileID
 	reply.Replicas = e.replicas
 	reply.Status = e.status
 	return nil
@@ -344,6 +414,7 @@ func (mds *MetadataServer) ListDir(path string, reply *[]types.FileInfo) error {
 			Mode:      child.mode,
 			CreatedAt: child.createdAt,
 			ModTime:   child.modTime,
+			FileID:    child.fileID,
 		})
 	}
 	sort.Slice(infos, func(i, j int) bool {
@@ -373,6 +444,7 @@ func (mds *MetadataServer) Stat(path string, reply *types.FileInfo) error {
 		Mode:      e.mode,
 		CreatedAt: e.createdAt,
 		ModTime:   e.modTime,
+		FileID:    e.fileID,
 	}
 	return nil
 }
@@ -416,9 +488,20 @@ func (mds *MetadataServer) lookup(path string) *entry {
 	return current
 }
 
+// generateFileID generates a stable object identity (inode equivalent) using
+// 16 random bytes encoded as hex. Stays zero external dependency by using crypto/rand.
+func generateFileID() (string, error) {
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("generate file id failed: %w", err)
+	}
+	return hex.EncodeToString(buf), nil
+}
+
 // selectDataNodes selects N distinct data nodes for a file's replicas.
 // Uses hash-based assignment to spread files deterministically across nodes.
-func (mds *MetadataServer) selectDataNodes(path string, replicaCount int) []types.Replica {
+// fileID determines the physical path on each DataNode: /data/{fileID}.
+func (mds *MetadataServer) selectDataNodes(path string, fileID string, replicaCount int) []types.Replica {
 	n := replicaCount
 	if n > len(mds.dataNodes) {
 		n = len(mds.dataNodes)
@@ -437,6 +520,7 @@ func (mds *MetadataServer) selectDataNodes(path string, replicaCount int) []type
 		startIdx = -startIdx
 	}
 
+	remotePath := "/data/" + fileID
 	replicas := make([]types.Replica, 0, n)
 	seen := make(map[string]bool)
 	for i := 0; i < n; i++ {
@@ -448,7 +532,7 @@ func (mds *MetadataServer) selectDataNodes(path string, replicaCount int) []type
 		seen[addr] = true
 		replicas = append(replicas, types.Replica{
 			Addr:       addr,
-			RemotePath: path,
+			RemotePath: remotePath,
 		})
 	}
 	return replicas
@@ -482,6 +566,7 @@ type entrySnapshot struct {
 	CreatedAt time.Time                 `json:"created_at"`
 	ModTime   time.Time                 `json:"mod_time"`
 	Status    string                    `json:"status,omitempty"`
+	FileID    string                    `json:"file_id,omitempty"`
 	Replicas  []types.Replica           `json:"replicas,omitempty"`
 	Children  map[string]*entrySnapshot `json:"children,omitempty"`
 }
@@ -495,6 +580,7 @@ func (e *entry) toSnapshot() *entrySnapshot {
 		CreatedAt: e.createdAt,
 		ModTime:   e.modTime,
 		Status:    e.status,
+		FileID:    e.fileID,
 		Replicas:  e.replicas,
 	}
 	if e.isDir {
@@ -515,6 +601,7 @@ func (s *entrySnapshot) toEntry() *entry {
 		createdAt: s.CreatedAt,
 		modTime:   s.ModTime,
 		status:    s.Status,
+		fileID:    s.FileID,
 		replicas:  s.Replicas,
 	}
 	if s.IsDir {

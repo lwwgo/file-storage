@@ -30,6 +30,10 @@ func (mds *MetadataServer) Apply(op string, data []byte) error {
 		return mds.applyCompleteFile(&payload)
 	case OpDelete:
 		return mds.applyDelete(&payload)
+	case OpRename:
+		return mds.applyRename(&payload)
+	case OpUpdateSize:
+		return mds.applyUpdateSize(&payload)
 	default:
 		return fmt.Errorf("unknown command op: %s", op)
 	}

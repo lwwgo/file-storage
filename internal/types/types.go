@@ -18,6 +18,10 @@ type FileInfo struct {
 	Mode      uint32    `json:"mode"`
 	CreatedAt time.Time `json:"created_at"`
 	ModTime   time.Time `json:"mod_time"`
+	// FileID 是文件对象的稳定身份（inode 等价物）。
+	// 创建时生成，rename/unlink 后保持不变，DataNode 物理路径为 /data/{FileID}。
+	// 目录的 FileID 为空字符串。
+	FileID string `json:"file_id,omitempty"`
 }
 
 // Replica describes one copy of a file on a specific data node.
@@ -28,6 +32,7 @@ type Replica struct {
 
 // FileLocation describes where all replicas of a file are stored.
 type FileLocation struct {
+	FileID   string    `json:"file_id"`  // stable object identity (inode equivalent)
 	Replicas []Replica `json:"replicas"` // all replica locations
 	Status   string    `json:"status"`   // file status: "pending" or "complete"
 }
@@ -66,6 +71,12 @@ type MetadataService interface {
 
 	// Delete 删除文件或目录，返回需要清理的数据节点列表。
 	Delete(path string, reply *DeleteReply) error
+
+	// Rename 重命名/移动文件或目录，FileID 不变（走 Raft 原子操作）。
+	Rename(args *RenameArgs, reply *bool) error
+
+	// UpdateSize 更新文件大小（写成功后由 client 调用），只改元数据不碰数据。
+	UpdateSize(args *UpdateSizeArgs, reply *bool) error
 
 	// ListDataNodes 列出所有已注册的数据节点。
 	ListDataNodes(_ struct{}, reply *[]string) error
@@ -108,14 +119,26 @@ type DeleteReply struct {
 	IsDir    bool      `json:"is_dir"`
 }
 
+// RenameArgs 重命名/移动的请求参数。
+type RenameArgs struct {
+	SrcPath string `json:"src_path"`
+	DstPath string `json:"dst_path"`
+}
+
+// UpdateSizeArgs 更新文件大小的请求参数。
+type UpdateSizeArgs struct {
+	Path string `json:"path"`
+	Size int64  `json:"size"`
+}
+
 // ===== DataNode RPC 接口定义 =====
 
 // DataService 数据节点服务，存储实际的文件内容。
 type DataService interface {
-	// StoreData 存储文件内容。
+	// StoreData 存储文件内容（整文件覆盖，兼容旧 CLI）。
 	StoreData(args *StoreArgs, reply *bool) error
 
-	// GetData 读取文件内容。
+	// GetData 读取文件内容（整文件读，兼容旧 CLI）。
 	GetData(path string, reply *[]byte) error
 
 	// DeleteData 删除文件内容。
@@ -126,10 +149,54 @@ type DataService interface {
 
 	// ListAllPaths 返回该数据节点持有的所有文件信息（供 MDS GC 用）。
 	ListAllPaths(_ struct{}, reply *[]NodeFile) error
+
+	// RangeRead 随机读取：从 offset 读最多 Length 字节。
+	// 到达文件末尾时返回 EOF=true（data 可能为空），不返回错误。
+	RangeRead(args *RangeReadArgs, reply *RangeReadReply) error
+
+	// PartialWrite 随机写入：向 offset 写入 Data，支持 sparse file。
+	PartialWrite(args *PartialWriteArgs, reply *bool) error
+
+	// Truncate 调整文件大小（缩小丢弃尾部，扩大补 0）。
+	Truncate(args *TruncateArgs, reply *bool) error
+
+	// Sync 强制 fsync 确保持久化。
+	Sync(args *SyncArgs, reply *bool) error
 }
 
 // StoreArgs 存储数据的请求参数。
 type StoreArgs struct {
 	Path    string `json:"path"`
 	Content []byte `json:"content"`
+}
+
+// RangeReadArgs 随机读取的请求参数。
+type RangeReadArgs struct {
+	Path   string `json:"path"`
+	Offset int64  `json:"offset"`
+	Length int64  `json:"length"`
+}
+
+// RangeReadReply 随机读取的响应：Data 为实际读到的字节，EOF 表示是否到达文件末尾。
+type RangeReadReply struct {
+	Data []byte `json:"data"`
+	EOF  bool   `json:"eof"`
+}
+
+// PartialWriteArgs 随机写入的请求参数。
+type PartialWriteArgs struct {
+	Path   string `json:"path"`
+	Offset int64  `json:"offset"`
+	Data   []byte `json:"data"`
+}
+
+// TruncateArgs 截断/扩展的请求参数。
+type TruncateArgs struct {
+	Path string `json:"path"`
+	Size int64  `json:"size"`
+}
+
+// SyncArgs fsync 的请求参数。
+type SyncArgs struct {
+	Path string `json:"path"`
 }

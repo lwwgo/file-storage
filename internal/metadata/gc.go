@@ -2,6 +2,7 @@ package metadata
 
 import (
 	"net/rpc"
+	"strings"
 	"time"
 
 	"github.com/lwwgo/fstorex/internal/types"
@@ -49,9 +50,9 @@ func (mds *MetadataServer) runGC() {
 	// 0. Health check: remove DataNodes that haven't heartbeat for too long
 	mds.checkDataNodeHealth()
 
-	// 1. Collect all valid file paths from metadata tree
-	validPaths := mds.collectValidPaths()
-	mds.logger.Debug("collected valid paths", "count", len(validPaths))
+	// 1. Collect all valid FileIDs from metadata tree (identity model, not path-based)
+	validFileIDs := mds.collectValidFileIDs()
+	mds.logger.Debug("collected valid file ids", "count", len(validFileIDs))
 
 	// 2. Get all registered DataNodes
 	mds.mu.RLock()
@@ -61,7 +62,7 @@ func (mds *MetadataServer) runGC() {
 
 	// 3. For each DataNode, list its files and delete orphans
 	for _, addr := range nodes {
-		mds.garbageCollectNode(addr, validPaths, gcStart)
+		mds.garbageCollectNode(addr, validFileIDs, gcStart)
 	}
 
 	mds.logger.Debug("GC cycle finished")
@@ -95,34 +96,40 @@ func (mds *MetadataServer) checkDataNodeHealth() {
 	}
 }
 
-// collectValidPaths walks the metadata tree and returns all file paths.
-func (mds *MetadataServer) collectValidPaths() map[string]bool {
+// collectValidFileIDs walks the metadata tree and returns all valid FileIDs.
+// This is the identity-based GC model: DataNode physical files are named
+// /data/{FileID}, so matching by FileID (not path) is the only correct way
+// to identify orphans after rename/unlink operations.
+func (mds *MetadataServer) collectValidFileIDs() map[string]bool {
 	mds.mu.RLock()
 	defer mds.mu.RUnlock()
 
-	paths := make(map[string]bool)
-	mds.collectPathsRecursive(mds.root, "", paths)
-	return paths
+	ids := make(map[string]bool)
+	mds.collectFileIDsRecursive(mds.root, ids)
+	return ids
 }
 
-func (mds *MetadataServer) collectPathsRecursive(e *entry, prefix string, paths map[string]bool) {
+func (mds *MetadataServer) collectFileIDsRecursive(e *entry, ids map[string]bool) {
 	if e == nil {
 		return
 	}
 	if !e.isDir {
-		paths[prefix] = true
+		if e.fileID != "" {
+			ids[e.fileID] = true
+		}
 		return
 	}
-	for name, child := range e.children {
-		childPath := prefix + "/" + name
-		mds.collectPathsRecursive(child, childPath, paths)
+	for _, child := range e.children {
+		mds.collectFileIDsRecursive(child, ids)
 	}
 }
 
 // garbageCollectNode connects to a DataNode, lists its files, and deletes orphans.
+// Matching is by FileID (identity model): NodeFile.Path is /data/{FileID}, so we
+// strip the prefix and compare against validFileIDs from the metadata tree.
 // gcStart is the time the current GC cycle started; files modified after
 // gcStart - gcSafetyWindow are skipped to protect files created during the scan.
-func (mds *MetadataServer) garbageCollectNode(addr string, validPaths map[string]bool, gcStart time.Time) {
+func (mds *MetadataServer) garbageCollectNode(addr string, validFileIDs map[string]bool, gcStart time.Time) {
 	client, err := rpc.Dial("tcp", addr)
 	if err != nil {
 		mds.logger.Warn("GC: cannot connect to data node, skipping", "node", addr, "error", err)
@@ -142,11 +149,13 @@ func (mds *MetadataServer) garbageCollectNode(addr string, validPaths map[string
 	deleted := 0
 	skippedNew := 0
 	for _, nf := range nodeFiles {
-		if validPaths[nf.Path] {
+		// Extract FileID from physical path: /data/{FileID}
+		fileID := strings.TrimPrefix(nf.Path, "/data/")
+		if fileID != "" && validFileIDs[fileID] {
 			continue // still referenced by metadata, keep it
 		}
 		// mtime protection: skip recently modified files that may have been
-		// created during the GC scan but not yet in validPaths.
+		// created during the GC scan but not yet in validFileIDs.
 		if nf.ModTime.After(cutoff) {
 			skippedNew++
 			continue

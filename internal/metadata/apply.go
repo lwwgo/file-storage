@@ -95,9 +95,12 @@ func (mds *MetadataServer) applyCreateFile(p *commandPayload) error {
 
 	now := time.Now()
 	createdAt := now
+	fileID := p.FileID // 新文件使用 payload 中的 FileID
 	if exists {
 		// POSIX O_TRUNC preserves creation time; only modTime updates.
 		createdAt = existing.createdAt
+		// FileID 不变：覆盖时保留旧对象身份，绝不重新生成（FileID 是 inode 等价物）
+		fileID = existing.fileID
 	}
 	current.children[fileName] = &entry{
 		name:      fileName,
@@ -107,6 +110,7 @@ func (mds *MetadataServer) applyCreateFile(p *commandPayload) error {
 		createdAt: createdAt,
 		modTime:   now,
 		status:    StatusPending,
+		fileID:    fileID,
 		replicas:  p.Replicas,
 	}
 	current.modTime = now
@@ -148,5 +152,105 @@ func (mds *MetadataServer) applyDelete(p *commandPayload) error {
 	}
 	delete(current.children, fileName)
 	current.modTime = time.Now()
+	return nil
+}
+
+// applyRename renames/moves a file or directory.
+// FileID stays unchanged (inode identity preserved); DataNode physical paths are never touched.
+// If dst exists as a file, it's overwritten (old entry's replicas become GC orphans).
+// If dst exists as a directory, the operation is rejected.
+func (mds *MetadataServer) applyRename(p *commandPayload) error {
+	srcParts := splitPath(p.Path)
+	dstParts := splitPath(p.DstPath)
+	if len(srcParts) == 0 || len(dstParts) == 0 {
+		return fmt.Errorf("invalid path: src=%s dst=%s", p.Path, p.DstPath)
+	}
+
+	srcFileName := srcParts[len(srcParts)-1]
+	dstFileName := dstParts[len(dstParts)-1]
+	srcDirParts := srcParts[:len(srcParts)-1]
+	dstDirParts := dstParts[:len(dstParts)-1]
+
+	// Find src parent
+	srcParent := mds.root
+	for _, part := range srcDirParts {
+		child, exists := srcParent.children[part]
+		if !exists || !child.isDir {
+			return fmt.Errorf("source path not found: %s", p.Path)
+		}
+		srcParent = child
+	}
+	srcEntry, exists := srcParent.children[srcFileName]
+	if !exists {
+		return fmt.Errorf("source path not found: %s", p.Path)
+	}
+
+	// Prevent directory cycles: moving a directory into its own subtree would
+	// create a cycle that overflows recursive traversal (GC, ListDir, etc.).
+	if srcEntry.isDir {
+		// Walk dst parent chain; if we encounter srcEntry, reject.
+		ancestor := mds.root
+		ancestorFound := false
+		for _, part := range dstDirParts {
+			if ancestor == srcEntry {
+				ancestorFound = true
+				break
+			}
+			child, exists := ancestor.children[part]
+			if !exists || !child.isDir {
+				break // dst parent doesn't exist yet, no cycle possible
+			}
+			ancestor = child
+		}
+		if ancestorFound || ancestor == srcEntry {
+			return fmt.Errorf("cannot move directory into its own subtree: %s -> %s", p.Path, p.DstPath)
+		}
+	}
+
+	// Find dst parent
+	dstParent := mds.root
+	for _, part := range dstDirParts {
+		child, exists := dstParent.children[part]
+		if !exists || !child.isDir {
+			return fmt.Errorf("destination parent directory not found: %s", p.DstPath)
+		}
+		dstParent = child
+	}
+
+	// Check dst conflict
+	if dstEntry, exists := dstParent.children[dstFileName]; exists {
+		if dstEntry.isDir {
+			return fmt.Errorf("destination is an existing directory: %s", p.DstPath)
+		}
+		// dst is an existing file: overwrite it. Old entry's replicas become
+		// orphans and will be cleaned by GC based on FileID matching.
+		delete(dstParent.children, dstFileName)
+	}
+
+	// Detach from src parent, attach to dst parent with new name.
+	// FileID, replicas, createdAt, status all stay unchanged.
+	delete(srcParent.children, srcFileName)
+	srcEntry.name = dstFileName
+	dstParent.children[dstFileName] = srcEntry
+
+	now := time.Now()
+	srcParent.modTime = now
+	dstParent.modTime = now
+	srcEntry.modTime = now
+	return nil
+}
+
+// applyUpdateSize updates only the file's size and modTime.
+// Does not touch replicas or FileID.
+func (mds *MetadataServer) applyUpdateSize(p *commandPayload) error {
+	e := mds.lookup(p.Path)
+	if e == nil {
+		return fmt.Errorf("path not found: %s", p.Path)
+	}
+	if e.isDir {
+		return fmt.Errorf("%s is a directory, cannot update size", p.Path)
+	}
+	e.size = p.NewSize
+	e.modTime = time.Now()
 	return nil
 }

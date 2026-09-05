@@ -12,6 +12,7 @@ import (
 	"net/rpc"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/lwwgo/fstorex/internal/types"
 )
@@ -369,6 +370,235 @@ func (c *Client) TriggerGC() error {
 	var reply bool
 	if err := c.callMDSWithRedirect("MetadataService.TriggerGC", struct{}{}, &reply); err != nil {
 		return fmt.Errorf("trigger GC failed: %w", err)
+	}
+	return nil
+}
+
+// ===== FileHandle 相关 Client 方法 =====
+
+// Open 打开或创建文件，返回 FileHandle。
+//
+// 语义（对齐 POSIX）：
+//   - 不存在 + O_CREAT → 创建新文件（新 FileID，status=pending）
+//   - 不存在 + 无 O_CREAT → 返回 ENOENT
+//   - 已存在 + O_EXCL → 返回错误（排他创建）
+//   - 已存在 + O_TRUNC → 打开原文件并截断为 0（FileID 不变，先数据后元数据）
+//   - 已存在 + 无 O_TRUNC → 正常打开
+func (c *Client) Open(path string, flags int) (*FileHandle, error) {
+	// 1. 检查文件是否存在
+	info, err := c.Stat(path)
+	exists := err == nil
+	if err != nil && !strings.Contains(err.Error(), "not found") {
+		return nil, fmt.Errorf("open: stat failed: %w", err)
+	}
+
+	var fileID string
+	var size int64
+	var status string
+	var replicas []types.Replica
+
+	if !exists {
+		// 文件不存在
+		if flags&O_CREAT == 0 {
+			return nil, fmt.Errorf("open: no such file or directory: %s", path)
+		}
+		// O_CREAT: 创建新文件
+		createArgs := &types.CreateFileArgs{
+			Path:       path,
+			Size:       0,
+			CreateMode: types.CreateIfNotExist, // O_CREAT 不覆盖，O_TRUNC 单独处理
+		}
+		var createReply types.CreateFileReply
+		if err := c.callMDSWithRedirect("MetadataService.CreateFile", createArgs, &createReply); err != nil {
+			return nil, fmt.Errorf("open: create failed: %w", err)
+		}
+		replicas = createReply.Replicas
+		status = "pending"
+		size = 0
+		// fileID 将从 GetFileLocation 拿到
+	} else {
+		// 文件已存在
+		if flags&O_EXCL != 0 {
+			return nil, fmt.Errorf("open: file already exists (O_EXCL): %s", path)
+		}
+		if info.IsDir {
+			return nil, fmt.Errorf("open: is a directory: %s", path)
+		}
+		// O_TRUNC: 打开原文件并截断为 0（FileID 不变）
+		if flags&O_TRUNC != 0 {
+			if err := c.truncateAllReplicas(path, 0); err != nil {
+				return nil, fmt.Errorf("open: truncate replicas failed: %w", err)
+			}
+			// 先数据后元数据
+			if err := c.updateSize(path, 0); err != nil {
+				return nil, fmt.Errorf("open: update size failed: %w", err)
+			}
+			size = 0
+		} else {
+			size = info.Size
+		}
+	}
+
+	// 2. 获取副本位置（同时拿到 FileID）
+	loc, err := c.getFileLocation(path)
+	if err != nil {
+		return nil, fmt.Errorf("open: get location failed: %w", err)
+	}
+	fileID = loc.FileID
+	if replicas == nil {
+		replicas = loc.Replicas
+	}
+	if status == "" {
+		status = loc.Status
+	}
+
+	c.logger.Info("file opened", "path", path, "file_id", fileID, "flags", flags, "size", size, "status", status)
+	return &FileHandle{
+		client:   c,
+		path:     path,
+		fileID:   fileID,
+		flags:    flags,
+		replicas: replicas,
+		size:     size,
+		status:   status,
+	}, nil
+}
+
+// Rename 重命名/移动文件或目录。FileID 不变，已打开的 FileHandle 仍指向原对象。
+func (c *Client) Rename(src, dst string) error {
+	args := &types.RenameArgs{SrcPath: src, DstPath: dst}
+	var reply bool
+	if err := c.callMDSWithRedirect("MetadataService.Rename", args, &reply); err != nil {
+		return fmt.Errorf("rename failed: %w", err)
+	}
+	c.logger.Info("path renamed", "src", src, "dst", dst)
+	return nil
+}
+
+// ===== FileHandle 内部辅助方法 =====
+
+// truncateAllReplicas 并行截断所有副本到 size，全部成功才返回。
+func (c *Client) truncateAllReplicas(path string, size int64) error {
+	loc, err := c.getFileLocation(path)
+	if err != nil {
+		return err
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, len(loc.Replicas))
+	for i, replica := range loc.Replicas {
+		wg.Add(1)
+		go func(idx int, r types.Replica) {
+			defer wg.Done()
+			errs[idx] = c.truncateReplica(r, size)
+		}(i, replica)
+	}
+	wg.Wait()
+
+	var firstErr error
+	for _, err := range errs {
+		if err != nil {
+			firstErr = err
+			break
+		}
+	}
+	return firstErr
+}
+
+// updateSize 调用 MDS 更新文件大小。
+func (c *Client) updateSize(path string, size int64) error {
+	args := &types.UpdateSizeArgs{Path: path, Size: size}
+	var reply bool
+	return c.callMDSWithRedirect("MetadataService.UpdateSize", args, &reply)
+}
+
+// getFileLocation 查询文件位置并返回 FileID。
+func (c *Client) getFileLocation(path string) (*types.FileLocation, error) {
+	mds, err := c.dialMDS()
+	if err != nil {
+		return nil, err
+	}
+	defer mds.Close()
+
+	var loc types.FileLocation
+	if err := mds.Call("MetadataService.GetFileLocation", path, &loc); err != nil {
+		return nil, err
+	}
+	return &loc, nil
+}
+
+// rangeRead 从指定副本随机读取，返回实际读到字节数、是否 EOF、错误。
+func (c *Client) rangeRead(replica types.Replica, offset int64, buf []byte) (int, bool, error) {
+	dn, err := c.dialDataNode(replica.Addr)
+	if err != nil {
+		return 0, false, err
+	}
+	defer dn.Close()
+
+	args := &types.RangeReadArgs{
+		Path:   replica.RemotePath,
+		Offset: offset,
+		Length: int64(len(buf)),
+	}
+	var reply types.RangeReadReply
+	if err := dn.Call("DataService.RangeRead", args, &reply); err != nil {
+		return 0, false, fmt.Errorf("range read failed: %w", err)
+	}
+	n := copy(buf, reply.Data)
+	return n, reply.EOF, nil
+}
+
+// partialWrite 向指定副本随机写入。
+func (c *Client) partialWrite(replica types.Replica, offset int64, data []byte) error {
+	dn, err := c.dialDataNode(replica.Addr)
+	if err != nil {
+		return err
+	}
+	defer dn.Close()
+
+	args := &types.PartialWriteArgs{
+		Path:   replica.RemotePath,
+		Offset: offset,
+		Data:   data,
+	}
+	var reply bool
+	if err := dn.Call("DataService.PartialWrite", args, &reply); err != nil {
+		return fmt.Errorf("partial write failed: %w", err)
+	}
+	return nil
+}
+
+// truncateReplica 截断指定副本。
+func (c *Client) truncateReplica(replica types.Replica, size int64) error {
+	dn, err := c.dialDataNode(replica.Addr)
+	if err != nil {
+		return err
+	}
+	defer dn.Close()
+
+	args := &types.TruncateArgs{
+		Path: replica.RemotePath,
+		Size: size,
+	}
+	var reply bool
+	if err := dn.Call("DataService.Truncate", args, &reply); err != nil {
+		return fmt.Errorf("truncate failed: %w", err)
+	}
+	return nil
+}
+
+// syncReplica fsync 指定副本。
+func (c *Client) syncReplica(replica types.Replica) error {
+	dn, err := c.dialDataNode(replica.Addr)
+	if err != nil {
+		return err
+	}
+	defer dn.Close()
+
+	args := &types.SyncArgs{Path: replica.RemotePath}
+	var reply bool
+	if err := dn.Call("DataService.Sync", args, &reply); err != nil {
+		return fmt.Errorf("sync failed: %w", err)
 	}
 	return nil
 }
