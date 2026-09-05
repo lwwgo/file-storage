@@ -60,11 +60,21 @@ type MetadataService interface {
 	ListDataNodes(_ struct{}, reply *[]string) error
 }
 
+// CreateMode 控制文件已存在时的行为（互斥二选一）。
+type CreateMode uint32
+
+const (
+	// CreateIfNotExist 默认：不存在才创建，已存在则报错（类似 POSIX O_CREAT|O_EXCL）。
+	CreateIfNotExist CreateMode = iota
+	// OverwriteIfExists 不存在则创建，已存在则覆盖（类似 POSIX O_CREAT|O_TRUNC）。
+	OverwriteIfExists
+)
+
 // CreateFileArgs 创建文件的请求参数。
 type CreateFileArgs struct {
-	Path    string `json:"path"`
-	Size    int64  `json:"size"`
-	Content string `json:"content_type"` // MIME 类型
+	Path       string     `json:"path"`
+	Size       int64      `json:"size"`
+	CreateMode CreateMode `json:"create_mode"` // 文件已存在时的行为，默认 CreateIfNotExist
 }
 
 // CreateFileReply is the response for creating a file, containing all assigned replica locations.

@@ -1,0 +1,10 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: standard
+  disable:
+    # 不强制检查所有返回值是否被处理（如 os.Remove、fmt.Fprintf 等清理/输出操作）
+    - errcheck
