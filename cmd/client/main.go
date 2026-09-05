@@ -25,8 +25,8 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/lwwgo/file-storage/internal/client"
-	"github.com/lwwgo/file-storage/internal/types"
+	"github.com/lwwgo/fstorex/internal/client"
+	"github.com/lwwgo/fstorex/internal/types"
 )
 
 func main() {
@@ -186,7 +186,7 @@ func main() {
 }
 
 func printUsage() {
-	fmt.Println("Distributed File Storage Client")
+	fmt.Println("FStoreX Client")
 	fmt.Println()
 	fmt.Println("Usage: client -mds=<addr> <command> [args]")
 	fmt.Println()

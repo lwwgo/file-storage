@@ -1,4 +1,4 @@
-# file-storage Makefile
+# FStoreX Makefile
 # Distributed file storage with Raft consensus metadata server.
 
 .PHONY: all build test lint fmt tidy clean

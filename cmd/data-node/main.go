@@ -17,7 +17,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/lwwgo/file-storage/internal/datanode"
+	"github.com/lwwgo/fstorex/internal/datanode"
 )
 
 func main() {

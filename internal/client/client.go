@@ -13,7 +13,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/lwwgo/file-storage/internal/types"
+	"github.com/lwwgo/fstorex/internal/types"
 )
 
 // Client 分布式文件系统客户端。

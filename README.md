@@ -1,4 +1,4 @@
-# File Storage — Distributed File Storage with Raft-based High Availability
+# FStoreX — Distributed File Storage with Raft-based High Availability
 
 A distributed file storage system providing a Unix-like hierarchical directory tree interface. The system consists of three independent binaries communicating via Go's standard `net/rpc` package, depending only on [goraft](https://github.com/lwwgo/goraft) (which itself has zero external dependencies). The metadata server uses the goraft consensus protocol to form a 3-node highly available cluster.
 
@@ -209,7 +209,7 @@ Three layers of defense against "metadata exists but no data" inconsistencies:
 ### One-Click Demo
 
 ```bash
-cd file-storage
+cd fstorex
 chmod +x start.sh
 ./start.sh
 
@@ -222,7 +222,7 @@ The script automatically builds and starts **3 MDS nodes (Raft cluster) + 2 Data
 ### Build & Test with Make
 
 ```bash
-cd file-storage
+cd fstorex
 make build    # Build all 3 binaries to bin/
 make test     # Run unit tests with race detection + coverage
 make lint     # Run golangci-lint (falls back to go vet)
@@ -232,7 +232,7 @@ make all      # lint + test + build
 ### Manually Build the Three Binaries
 
 ```bash
-cd file-storage
+cd fstorex
 mkdir -p bin
 go build -o bin/metadata-server ./cmd/metadata-server
 go build -o bin/data-node ./cmd/data-node
@@ -292,7 +292,7 @@ go build -o bin/client ./cmd/client
 ## Project Structure
 
 ```
-file-storage/
+fstorex/
 ├── cmd/                           # Three independent entry points
 │   ├── metadata-server/main.go    # Metadata server binary (Raft node)
 │   ├── data-node/main.go          # Data node binary
@@ -353,7 +353,7 @@ The project depends on [goraft](https://github.com/lwwgo/goraft), a standalone R
 ## Testing
 
 ```bash
-cd file-storage
+cd fstorex
 make build    # or: go build ./...
 make test     # or: go test -v -race -cover ./...
 make lint     # or: golangci-lint run ./... / go vet ./...

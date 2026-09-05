@@ -1,4 +1,4 @@
-module github.com/lwwgo/file-storage
+module github.com/lwwgo/fstorex
 
 go 1.27
 

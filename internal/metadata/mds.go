@@ -21,7 +21,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/lwwgo/file-storage/internal/types"
+	"github.com/lwwgo/fstorex/internal/types"
 	"github.com/lwwgo/goraft/raft"
 	rafttypes "github.com/lwwgo/goraft/types"
 )
