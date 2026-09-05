@@ -3,10 +3,10 @@
 // MDS 职责：
 //  1. 管理全局目录树（文件名、目录结构、权限、时间戳）
 //  2. 管理文件→数据节点的映射（文件内容存在哪个 DataNode 上）
-//  3. 管理 DataNode 注册（DataNode 启动时向 MDS 注册）
+//  3. 管理 DataNode 生命周期（首次心跳即注册，超时即摘除）
 //
 // 高可用：多个 MDS 节点组成 Raft 集群，通过 goraft 保证元数据一致性。
-//   - 写操作（Mkdir/CreateFile/Delete/RegisterDataNode）：仅 leader 可处理，走 Raft 共识复制到多数派后应用。
+//   - 写操作（Mkdir/CreateFile/Delete/Heartbeat/RemoveDataNode）：仅 leader 可处理，走 Raft 共识复制到多数派后应用。
 //   - 读操作（GetFileLocation/ListDir/Stat/ListDataNodes）：所有节点都可处理，直接读本地状态机副本。
 //   - follower 收到写请求时返回 leader 地址，客户端自动重定向。
 package metadata
@@ -28,11 +28,12 @@ import (
 
 // 写操作类型常量
 const (
-	OpRegisterDataNode = "register_dn"
-	OpMkdir            = "mkdir"
-	OpCreateFile       = "create_file"
-	OpCompleteFile     = "complete_file"
-	OpDelete           = "delete"
+	OpHeartbeat      = "heartbeat"
+	OpRemoveDataNode = "remove_dn"
+	OpMkdir          = "mkdir"
+	OpCreateFile     = "create_file"
+	OpCompleteFile   = "complete_file"
+	OpDelete         = "delete"
 )
 
 // 文件状态（仅文件节点有效）
@@ -47,7 +48,7 @@ const (
 type commandPayload struct {
 	Op         string           `json:"op"`
 	Path       string           `json:"path,omitempty"`
-	Addr       string           `json:"addr,omitempty"` // register_dn: data node address
+	Addr       string           `json:"addr,omitempty"` // heartbeat/remove_dn: data node address
 	Size       int64            `json:"size,omitempty"` // create_file: file size
 	Replicas   []types.Replica  `json:"replicas,omitempty"`
 	IsDir      bool             `json:"is_dir,omitempty"`      // delete: whether the target is a directory
@@ -75,12 +76,13 @@ type entry struct {
 // It also implements goraft's StateMachine interface: Raft handles log replication,
 // while MetadataServer applies logs to the directory tree state machine.
 type MetadataServer struct {
-	mu           sync.RWMutex
-	root         *entry   // root directory
-	dataNodes    []string // registered data node addresses
-	raftServer   *raft.Server
-	logger       *slog.Logger
-	replicaCount int // desired number of replicas per file (default 3)
+	mu            sync.RWMutex
+	root          *entry               // root directory
+	dataNodes     []string             // registered data node addresses
+	lastHeartbeat map[string]time.Time // data node address → last heartbeat time
+	raftServer    *raft.Server
+	logger        *slog.Logger
+	replicaCount  int // desired number of replicas per file (default 3)
 }
 
 // NewMetadataServer 创建并启动集成了 Raft 的元数据服务器。
@@ -98,9 +100,10 @@ func NewMetadataServer(raftConfig rafttypes.Config, logger *slog.Logger) (*Metad
 			modTime:   time.Now(),
 			children:  make(map[string]*entry),
 		},
-		dataNodes:    make([]string, 0),
-		logger:       logger,
-		replicaCount: 3, // default: 3 replicas per file
+		dataNodes:     make([]string, 0),
+		lastHeartbeat: make(map[string]time.Time),
+		logger:        logger,
+		replicaCount:  3, // default: 3 replicas per file
 	}
 
 	// 把 mds 作为 StateMachine 注入 Raft
@@ -180,17 +183,17 @@ func (mds *MetadataServer) submitCommand(payload *commandPayload) error {
 	return nil
 }
 
-// RegisterDataNode 数据节点向 MDS 注册。
-func (mds *MetadataServer) RegisterDataNode(addr string, reply *bool) error {
+// Heartbeat 数据节点定期发送心跳，首次心跳即注册，超时则被移除。
+func (mds *MetadataServer) Heartbeat(addr string, reply *types.HeartbeatReply) error {
 	if err := mds.checkLeader(); err != nil {
 		return err
 	}
-	payload := &commandPayload{Op: OpRegisterDataNode, Addr: addr}
+	payload := &commandPayload{Op: OpHeartbeat, Addr: addr}
 	if err := mds.submitCommand(payload); err != nil {
 		return err
 	}
-	*reply = true
-	mds.logger.Info("data node registered via raft", "addr", addr)
+	reply.IsLeader = true
+	mds.logger.Debug("data node heartbeat received", "addr", addr)
 	return nil
 }
 
@@ -454,8 +457,9 @@ func (mds *MetadataServer) selectDataNodes(path string, replicaCount int) []type
 // ===== JSON 序列化辅助结构（Snapshot/Restore 用）=====
 
 type metaSnapshot struct {
-	Root      *entrySnapshot `json:"root"`
-	DataNodes []string       `json:"data_nodes"`
+	Root          *entrySnapshot       `json:"root"`
+	DataNodes     []string             `json:"data_nodes"`
+	LastHeartbeat map[string]time.Time `json:"last_heartbeat"`
 }
 
 func (s *metaSnapshot) toEntry() *entry {

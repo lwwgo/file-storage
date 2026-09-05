@@ -43,8 +43,8 @@ type NodeFile struct {
 
 // MetadataService 元数据服务，管理目录树和文件→数据节点的映射。
 type MetadataService interface {
-	// RegisterDataNode 数据节点启动时调用，向 MDS 注册自己。
-	RegisterDataNode(addr string, reply *bool) error
+	// Heartbeat 数据节点定期发送心跳，首次心跳即注册，超时则被移除。
+	Heartbeat(addr string, reply *HeartbeatReply) error
 
 	// Mkdir 创建目录。
 	Mkdir(path string, reply *bool) error
@@ -89,6 +89,12 @@ type CreateFileArgs struct {
 	Path       string     `json:"path"`
 	Size       int64      `json:"size"`
 	CreateMode CreateMode `json:"create_mode"` // 文件已存在时的行为，默认 CreateIfNotExist
+}
+
+// HeartbeatReply 是心跳响应，告知 DataNode 当前 MDS 角色及 leader 地址。
+type HeartbeatReply struct {
+	IsLeader bool   `json:"is_leader"` // 当前节点是否 leader
+	Leader   string `json:"leader"`    // 如果不是 leader，告知 leader 地址
 }
 
 // CreateFileReply is the response for creating a file, containing all assigned replica locations.

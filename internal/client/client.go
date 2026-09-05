@@ -37,7 +37,7 @@ func (c *Client) dialMDS() (*rpc.Client, error) {
 }
 
 // callMDSWithRedirect 调用 MDS RPC，自动处理 follower→leader 重定向。
-// 写操作（Mkdir/CreateFile/Delete/RegisterDataNode）仅 leader 可处理，
+// 写操作（Mkdir/CreateFile/Delete/Heartbeat/RemoveDataNode）仅 leader 可处理，
 // follower 会返回 "not leader, redirect to <addr>" 错误，此方法自动提取地址并重试。
 func (c *Client) callMDSWithRedirect(method string, args, reply any) error {
 	addr := c.mdsAddr
