@@ -3,10 +3,19 @@ package metadata
 import (
 	"net/rpc"
 	"time"
+
+	"github.com/lwwgo/file-storage/internal/types"
 )
 
-// gcInterval is how often the leader scans for orphan data on DataNodes.
-const gcInterval = 5 * time.Minute
+const (
+	// gcInterval is how often the leader scans for orphan data on DataNodes.
+	gcInterval = 5 * time.Minute
+
+	// gcSafetyWindow is the grace period: files modified within this window before
+	// GC start are skipped to avoid deleting files created during the GC scan
+	// (which may not yet appear in the validPaths snapshot).
+	gcSafetyWindow = 30 * time.Second
+)
 
 // startGC starts the background garbage collection goroutine.
 // Only the leader should run GC; followers do nothing.
@@ -28,6 +37,11 @@ func (mds *MetadataServer) startGC() {
 func (mds *MetadataServer) runGC() {
 	mds.logger.Debug("GC cycle started")
 
+	// gcStart marks the beginning of this cycle. Files modified after
+	// gcStart - gcSafetyWindow are protected to avoid deleting files
+	// created during the GC scan (they may not yet be in validPaths).
+	gcStart := time.Now()
+
 	// 1. Collect all valid file paths from metadata tree
 	validPaths := mds.collectValidPaths()
 	mds.logger.Debug("collected valid paths", "count", len(validPaths))
@@ -38,9 +52,9 @@ func (mds *MetadataServer) runGC() {
 	copy(nodes, mds.dataNodes)
 	mds.mu.RUnlock()
 
-	// 3. For each DataNode, list its paths and delete orphans
+	// 3. For each DataNode, list its files and delete orphans
 	for _, addr := range nodes {
-		mds.garbageCollectNode(addr, validPaths)
+		mds.garbageCollectNode(addr, validPaths, gcStart)
 	}
 
 	mds.logger.Debug("GC cycle finished")
@@ -71,7 +85,9 @@ func (mds *MetadataServer) collectPathsRecursive(e *entry, prefix string, paths 
 }
 
 // garbageCollectNode connects to a DataNode, lists its files, and deletes orphans.
-func (mds *MetadataServer) garbageCollectNode(addr string, validPaths map[string]bool) {
+// gcStart is the time the current GC cycle started; files modified after
+// gcStart - gcSafetyWindow are skipped to protect files created during the scan.
+func (mds *MetadataServer) garbageCollectNode(addr string, validPaths map[string]bool, gcStart time.Time) {
 	client, err := rpc.Dial("tcp", addr)
 	if err != nil {
 		mds.logger.Warn("GC: cannot connect to data node, skipping", "node", addr, "error", err)
@@ -79,28 +95,38 @@ func (mds *MetadataServer) garbageCollectNode(addr string, validPaths map[string
 	}
 	defer client.Close()
 
-	var nodePaths []string
-	if err := client.Call("DataService.ListAllPaths", struct{}{}, &nodePaths); err != nil {
-		mds.logger.Warn("GC: failed to list paths from data node", "node", addr, "error", err)
+	var nodeFiles []types.NodeFile
+	if err := client.Call("DataService.ListAllPaths", struct{}{}, &nodeFiles); err != nil {
+		mds.logger.Warn("GC: failed to list files from data node", "node", addr, "error", err)
 		return
 	}
 
+	// Files modified after this cutoff are too new to be safe to delete.
+	cutoff := gcStart.Add(-gcSafetyWindow)
+
 	deleted := 0
-	for _, path := range nodePaths {
-		if validPaths[path] {
+	skippedNew := 0
+	for _, nf := range nodeFiles {
+		if validPaths[nf.Path] {
 			continue // still referenced by metadata, keep it
+		}
+		// mtime protection: skip recently modified files that may have been
+		// created during the GC scan but not yet in validPaths.
+		if nf.ModTime.After(cutoff) {
+			skippedNew++
+			continue
 		}
 		// Orphan: delete from this DataNode
 		var reply bool
-		if err := client.Call("DataService.DeleteData", path, &reply); err != nil {
-			mds.logger.Warn("GC: failed to delete orphan", "node", addr, "path", path, "error", err)
+		if err := client.Call("DataService.DeleteData", nf.Path, &reply); err != nil {
+			mds.logger.Warn("GC: failed to delete orphan", "node", addr, "path", nf.Path, "error", err)
 			continue
 		}
 		deleted++
-		mds.logger.Info("GC: deleted orphan file", "node", addr, "path", path)
+		mds.logger.Info("GC: deleted orphan file", "node", addr, "path", nf.Path)
 	}
 
-	mds.logger.Info("GC: data node cleaned", "node", addr, "orphans_deleted", deleted, "total_files", len(nodePaths))
+	mds.logger.Info("GC: data node cleaned", "node", addr, "orphans_deleted", deleted, "skipped_recent", skippedNew, "total_files", len(nodeFiles))
 }
 
 // TriggerGC is the RPC handler for manually triggering one GC cycle.
