@@ -29,6 +29,7 @@ type Replica struct {
 // FileLocation describes where all replicas of a file are stored.
 type FileLocation struct {
 	Replicas []Replica `json:"replicas"` // all replica locations
+	Status   string    `json:"status"`   // file status: "pending" or "complete"
 }
 
 // ===== MetadataServer RPC 接口定义 =====
@@ -44,6 +45,9 @@ type MetadataService interface {
 	// CreateFile 创建文件元数据，MDS 会选择多个数据节点分配多副本，返回副本位置。
 	CreateFile(args *CreateFileArgs, reply *CreateFileReply) error
 
+	// CompleteFile 标记文件数据已上传完成，状态从 pending 变为 complete。
+	CompleteFile(path string, reply *bool) error
+
 	// GetFileLocation 查询文件内容存储在哪些数据节点。
 	GetFileLocation(path string, reply *FileLocation) error
 
@@ -58,6 +62,9 @@ type MetadataService interface {
 
 	// ListDataNodes 列出所有已注册的数据节点。
 	ListDataNodes(_ struct{}, reply *[]string) error
+
+	// TriggerGC 手动触发一次孤儿数据垃圾回收（仅 leader 可调用）。
+	TriggerGC(_ struct{}, reply *bool) error
 }
 
 // CreateMode 控制文件已存在时的行为（互斥二选一）。
@@ -103,6 +110,9 @@ type DataService interface {
 
 	// HealthCheck 健康检查。
 	HealthCheck(_ struct{}, reply *bool) error
+
+	// ListAllPaths 返回该数据节点持有的所有文件相对路径（供 MDS GC 用）。
+	ListAllPaths(_ struct{}, reply *[]string) error
 }
 
 // StoreArgs 存储数据的请求参数。

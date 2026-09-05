@@ -23,6 +23,8 @@ func (mds *MetadataServer) Apply(op string, data []byte) error {
 		return mds.applyMkdir(&payload)
 	case OpCreateFile:
 		return mds.applyCreateFile(&payload)
+	case OpCompleteFile:
+		return mds.applyCompleteFile(&payload)
 	case OpDelete:
 		return mds.applyDelete(&payload)
 	default:

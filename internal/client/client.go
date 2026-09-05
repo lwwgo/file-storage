@@ -90,11 +90,34 @@ func (c *Client) Mkdir(path string) error {
 	return nil
 }
 
+// PutOption configures optional behavior for PutFile.
+type PutOption func(*putConfig)
+
+type putConfig struct {
+	createMode types.CreateMode
+}
+
+// WithCreateMode sets the CreateMode for PutFile (default: CreateIfNotExist).
+func WithCreateMode(mode types.CreateMode) PutOption {
+	return func(c *putConfig) {
+		c.createMode = mode
+	}
+}
+
 // PutFile uploads a local file to the distributed file system.
 // Flow: read local file → RPC MDS create metadata (get all replica locations) →
 //
 //	parallel RPC to all DataNodes to store content.
-func (c *Client) PutFile(localPath, remotePath string) error {
+//
+// Options:
+//
+//	WithCreateMode(types.OverwriteIfExists) — overwrite existing file instead of erroring.
+func (c *Client) PutFile(localPath, remotePath string, opts ...PutOption) error {
+	cfg := &putConfig{createMode: types.CreateIfNotExist}
+	for _, opt := range opts {
+		opt(cfg)
+	}
+
 	// 1. Read local file
 	content, err := os.ReadFile(localPath)
 	if err != nil {
@@ -104,8 +127,9 @@ func (c *Client) PutFile(localPath, remotePath string) error {
 
 	// 2. RPC MDS create file metadata, get all replica locations (auto-redirect to leader)
 	createArgs := &types.CreateFileArgs{
-		Path: remotePath,
-		Size: int64(len(content)),
+		Path:       remotePath,
+		Size:       int64(len(content)),
+		CreateMode: cfg.createMode,
 	}
 	var createReply types.CreateFileReply
 	if err := c.callMDSWithRedirect("MetadataService.CreateFile", createArgs, &createReply); err != nil {
@@ -155,10 +179,36 @@ func (c *Client) PutFile(localPath, remotePath string) error {
 
 	// Need at least one successful replica
 	if successCount == 0 {
+		// Best-effort cleanup: remove the metadata we just created to avoid
+		// leaving a ghost file (metadata exists but no data on any replica).
+		// The delete itself may fail (e.g. client crash before this point),
+		// so we log a warning but still return the original upload error.
+		if delErr := c.Delete(remotePath); delErr != nil {
+			c.logger.Warn("best-effort cleanup of ghost metadata failed", "path", remotePath, "error", delErr)
+		} else {
+			c.logger.Info("ghost metadata cleaned up", "path", remotePath)
+		}
 		return fmt.Errorf("all %d replica stores failed: %w", len(createReply.Replicas), firstErr)
 	}
 
+	// Mark file as complete so reads can succeed.
+	var completeReply bool
+	if err := c.callMDSWithRedirect("MetadataService.CompleteFile", remotePath, &completeReply); err != nil {
+		// Data was uploaded successfully; completion failure is non-fatal
+		// (file stays pending, GC will eventually clean it if never completed).
+		c.logger.Warn("failed to mark file complete", "path", remotePath, "error", err)
+	}
+
 	c.logger.Info("file uploaded", "remote", remotePath, "size", len(content), "replicas_ok", successCount, "replicas_total", len(createReply.Replicas))
+	return nil
+}
+
+// CompleteFile marks a file as complete after upload.
+func (c *Client) CompleteFile(path string) error {
+	var reply bool
+	if err := c.callMDSWithRedirect("MetadataService.CompleteFile", path, &reply); err != nil {
+		return fmt.Errorf("complete file failed: %w", err)
+	}
 	return nil
 }
 
@@ -176,7 +226,17 @@ func (c *Client) GetFile(remotePath, localPath string) error {
 	if err := mds.Call("MetadataService.GetFileLocation", remotePath, &loc); err != nil {
 		return fmt.Errorf("get file location failed: %w", err)
 	}
-	c.logger.Info("file locations resolved", "remote", remotePath, "replicas", len(loc.Replicas))
+	c.logger.Info("file locations resolved", "remote", remotePath, "replicas", len(loc.Replicas), "status", loc.Status)
+
+	// Pending files are treated as empty (like POSIX creat() before write):
+	// write 0-byte content directly without contacting DataNodes.
+	if loc.Status == "pending" {
+		if err := os.WriteFile(localPath, []byte{}, 0644); err != nil {
+			return fmt.Errorf("write local file failed: %w", err)
+		}
+		c.logger.Info("pending file downloaded as empty", "remote", remotePath, "local", localPath)
+		return nil
+	}
 
 	// 2. Try each replica in order until one succeeds
 	var content []byte
@@ -302,4 +362,13 @@ func (c *Client) ListDataNodes() ([]string, error) {
 		return nil, fmt.Errorf("list data nodes failed: %w", err)
 	}
 	return nodes, nil
+}
+
+// TriggerGC 手动触发一次孤儿数据垃圾回收。
+func (c *Client) TriggerGC() error {
+	var reply bool
+	if err := c.callMDSWithRedirect("MetadataService.TriggerGC", struct{}{}, &reply); err != nil {
+		return fmt.Errorf("trigger GC failed: %w", err)
+	}
+	return nil
 }
