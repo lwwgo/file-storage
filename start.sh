@@ -98,7 +98,7 @@ log "2. Create directories"
 # 3. 上传文件
 echo ""
 log "3. Upload files"
-echo "Hello Distributed File Storage! This is a Raft HA demo." > "$DATA_ROOT/test-upload.txt"
+echo "Hello FStoreX! This is a Raft HA demo." > "$DATA_ROOT/test-upload.txt"
 echo -n "FAKE_PNG_DATA_123456" > "$DATA_ROOT/test-image.bin"
 "$BIN_DIR/client" -mds="$MDS" put "$DATA_ROOT/test-upload.txt" /docs/readme.md
 "$BIN_DIR/client" -mds="$MDS" put "$DATA_ROOT/test-image.bin" /images/logo.png

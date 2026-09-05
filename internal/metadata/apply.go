@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/lwwgo/file-storage/internal/types"
+	"github.com/lwwgo/fstorex/internal/types"
 )
 
 // applyHeartbeat 处理心跳：首次心跳自动注册，后续更新最后心跳时间。

@@ -4,7 +4,7 @@ import (
 	"net/rpc"
 	"time"
 
-	"github.com/lwwgo/file-storage/internal/types"
+	"github.com/lwwgo/fstorex/internal/types"
 )
 
 const (

@@ -18,7 +18,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/lwwgo/file-storage/internal/types"
+	"github.com/lwwgo/fstorex/internal/types"
 )
 
 // heartbeatInterval is how often the DataNode sends a heartbeat to MDS.

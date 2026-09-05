@@ -28,7 +28,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/lwwgo/file-storage/internal/metadata"
+	"github.com/lwwgo/fstorex/internal/metadata"
 	rafttypes "github.com/lwwgo/goraft/types"
 )
 
