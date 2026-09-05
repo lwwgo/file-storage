@@ -25,8 +25,8 @@ A distributed file storage system providing a Unix-like hierarchical directory t
 
 | Component | Binary | Default Port(s) | Responsibility |
 |---|---|---|---|
-| **Metadata Server** | `metadata-server` | 9001/9002/9003 | Manages the global directory tree, file→DataNode mapping, multi-replica allocation, and DataNode heartbeat lifecycle; guarantees multi-node consistency via Raft |
-| **Data Node** | `data-node` | 9101+ | Stores actual file content to local disk; sends periodic heartbeats to MDS (first heartbeat = auto-registration, auto-redirects to leader); reports held paths for orphan GC |
+| **Metadata Server** | `fstorex-metadata` | 9001/9002/9003 | Manages the global directory tree, file→DataNode mapping, multi-replica allocation, and DataNode heartbeat lifecycle; guarantees multi-node consistency via Raft |
+| **Data Node** | `fstorex-datanode` | 9101+ | Stores actual file content to local disk; sends periodic heartbeats to MDS (first heartbeat = auto-registration, auto-redirects to leader); reports held paths for orphan GC |
 | **Client** | `client` | — | CLI tool; metadata operations go through MDS, data operations go MDS→DataNode; writes auto-redirect from follower to leader |
 
 ### Data Flow
@@ -234,59 +234,59 @@ make all      # lint + test + build
 ```bash
 cd fstorex
 mkdir -p bin
-go build -o bin/metadata-server ./cmd/metadata-server
-go build -o bin/data-node ./cmd/data-node
-go build -o bin/client ./cmd/client
+go build -o bin/fstorex-metadata ./cmd/fstorex-metadata
+go build -o bin/fstorex-datanode ./cmd/fstorex-datanode
+go build -o bin/fstorex ./cmd/fstorex
 ```
 
 ### Manually Start the Cluster
 
 ```bash
 # 1. Start 3 MDS nodes (Raft cluster)
-./bin/metadata-server -id=localhost:9001 -peers=localhost:9002,localhost:9003 -wal-dir=/tmp/mds1/wal -snap-dir=/tmp/mds1/snap
-./bin/metadata-server -id=localhost:9002 -peers=localhost:9001,localhost:9003 -wal-dir=/tmp/mds2/wal -snap-dir=/tmp/mds2/snap
-./bin/metadata-server -id=localhost:9003 -peers=localhost:9001,localhost:9002 -wal-dir=/tmp/mds3/wal -snap-dir=/tmp/mds3/snap
+./bin/fstorex-metadata -id=localhost:9001 -peers=localhost:9002,localhost:9003 -wal-dir=/tmp/mds1/wal -snap-dir=/tmp/mds1/snap
+./bin/fstorex-metadata -id=localhost:9002 -peers=localhost:9001,localhost:9003 -wal-dir=/tmp/mds2/wal -snap-dir=/tmp/mds2/snap
+./bin/fstorex-metadata -id=localhost:9003 -peers=localhost:9001,localhost:9002 -wal-dir=/tmp/mds3/wal -snap-dir=/tmp/mds3/snap
 
 # 2. Start data nodes (connect to any MDS; auto-redirects to leader)
-./bin/data-node -addr=:9101 -mds=localhost:9001 -data-dir=/tmp/dn1
-./bin/data-node -addr=:9102 -mds=localhost:9001 -data-dir=/tmp/dn2
+./bin/fstorex-datanode -addr=:9101 -mds=localhost:9001 -data-dir=/tmp/dn1
+./bin/fstorex-datanode -addr=:9102 -mds=localhost:9001 -data-dir=/tmp/dn2
 
 # 3. Use the client (connect to any MDS)
-./bin/client -mds=localhost:9001 nodes
+./bin/fstorex -mds=localhost:9001 nodes
 ```
 
 ### Client Commands
 
 ```bash
 # List active data nodes
-./bin/client -mds=localhost:9001 nodes
+./bin/fstorex -mds=localhost:9001 nodes
 
 # Create a directory
-./bin/client -mds=localhost:9001 mkdir /docs
+./bin/fstorex -mds=localhost:9001 mkdir /docs
 
 # Upload a file (local path → distributed path)
-./bin/client -mds=localhost:9001 put ./local.txt /docs/remote.txt
+./bin/fstorex -mds=localhost:9001 put ./local.txt /docs/remote.txt
 
 # Upload with overwrite (error if exists without -overwrite)
-./bin/client -mds=localhost:9001 put -overwrite ./local.txt /docs/remote.txt
+./bin/fstorex -mds=localhost:9001 put -overwrite ./local.txt /docs/remote.txt
 
 # Download a file (distributed path → local path)
-./bin/client -mds=localhost:9001 get /docs/remote.txt ./downloaded.txt
+./bin/fstorex -mds=localhost:9001 get /docs/remote.txt ./downloaded.txt
 
 # List a directory
-./bin/client -mds=localhost:9001 ls /docs
+./bin/fstorex -mds=localhost:9001 ls /docs
 
 # Show file/directory info
-./bin/client -mds=localhost:9001 stat /docs/remote.txt
+./bin/fstorex -mds=localhost:9001 stat /docs/remote.txt
 
 # Show replica locations for a file
-./bin/client -mds=localhost:9001 replicas /docs/remote.txt
+./bin/fstorex -mds=localhost:9001 replicas /docs/remote.txt
 
 # Delete a file or directory
-./bin/client -mds=localhost:9001 rm /docs/remote.txt
+./bin/fstorex -mds=localhost:9001 rm /docs/remote.txt
 
 # Manually trigger orphan data garbage collection
-./bin/client -mds=localhost:9001 gc
+./bin/fstorex -mds=localhost:9001 gc
 ```
 
 ## Project Structure
@@ -294,9 +294,9 @@ go build -o bin/client ./cmd/client
 ```
 fstorex/
 ├── cmd/                           # Three independent entry points
-│   ├── metadata-server/main.go    # Metadata server binary (Raft node)
-│   ├── data-node/main.go          # Data node binary
-│   └── client/main.go             # Client CLI binary
+│   ├── fstorex-metadata/main.go    # Metadata server binary (Raft node)
+│   ├── fstorex-datanode/main.go    # Data node binary
+│   └── fstorex/main.go             # Client CLI binary
 ├── internal/
 │   ├── types/types.go             # Shared types + RPC interface definitions
 │   ├── metadata/
