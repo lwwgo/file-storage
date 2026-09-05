@@ -51,17 +51,17 @@ mkdir -p "$DATA_ROOT/dn1" "$DATA_ROOT/dn2"
 # 启动 3 个 MDS 节点（Raft 集群）
 log "starting metadata server 1 (localhost:9001)..."
 "$BIN_DIR/fstorex-metadata" -id=localhost:9001 -peers=localhost:9002,localhost:9003 \
-    -wal-dir="$DATA_ROOT/mds1/wal" -snap-dir="$DATA_ROOT/mds1/snap" > "$DATA_ROOT/mds1.log" 2>&1 &
+    -waldir="$DATA_ROOT/mds1/wal" -snapdir="$DATA_ROOT/mds1/snap" > "$DATA_ROOT/mds1.log" 2>&1 &
 echo $! >> "$DATA_ROOT/.pids"
 
 log "starting metadata server 2 (localhost:9002)..."
 "$BIN_DIR/fstorex-metadata" -id=localhost:9002 -peers=localhost:9001,localhost:9003 \
-    -wal-dir="$DATA_ROOT/mds2/wal" -snap-dir="$DATA_ROOT/mds2/snap" > "$DATA_ROOT/mds2.log" 2>&1 &
+    -waldir="$DATA_ROOT/mds2/wal" -snapdir="$DATA_ROOT/mds2/snap" > "$DATA_ROOT/mds2.log" 2>&1 &
 echo $! >> "$DATA_ROOT/.pids"
 
 log "starting metadata server 3 (localhost:9003)..."
 "$BIN_DIR/fstorex-metadata" -id=localhost:9003 -peers=localhost:9001,localhost:9002 \
-    -wal-dir="$DATA_ROOT/mds3/wal" -snap-dir="$DATA_ROOT/mds3/snap" > "$DATA_ROOT/mds3.log" 2>&1 &
+    -waldir="$DATA_ROOT/mds3/wal" -snapdir="$DATA_ROOT/mds3/snap" > "$DATA_ROOT/mds3.log" 2>&1 &
 echo $! >> "$DATA_ROOT/.pids"
 
 # 等待 Raft 选举
@@ -70,11 +70,11 @@ sleep 5
 
 # 启动 2 个 DataNode（连任意 MDS 节点，会自动重定向到 leader）
 log "starting data node 1 on :9101..."
-"$BIN_DIR/fstorex-datanode" -addr=:9101 -mds=localhost:9001 -data-dir="$DATA_ROOT/dn1" > "$DATA_ROOT/dn1.log" 2>&1 &
+"$BIN_DIR/fstorex-datanode" -addr=:9101 -mds=localhost:9001 -datadir="$DATA_ROOT/dn1" > "$DATA_ROOT/dn1.log" 2>&1 &
 echo $! >> "$DATA_ROOT/.pids"
 
 log "starting data node 2 on :9102..."
-"$BIN_DIR/fstorex-datanode" -addr=:9102 -mds=localhost:9001 -data-dir="$DATA_ROOT/dn2" > "$DATA_ROOT/dn2.log" 2>&1 &
+"$BIN_DIR/fstorex-datanode" -addr=:9102 -mds=localhost:9001 -datadir="$DATA_ROOT/dn2" > "$DATA_ROOT/dn2.log" 2>&1 &
 echo $! >> "$DATA_ROOT/.pids"
 sleep 2
 

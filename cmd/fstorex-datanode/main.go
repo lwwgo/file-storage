@@ -2,7 +2,7 @@
 //
 // Usage:
 //
-//	./fstorex-datanode -addr=:9101 -mds=localhost:9001 -data-dir=/tmp/dn1
+//	./fstorex-datanode -addr=:9101 -mds=localhost:9001 -datadir=/tmp/dn1
 //
 // Responsibility: stores actual file content and registers itself with MDS on startup.
 package main
@@ -23,7 +23,7 @@ import (
 func main() {
 	addr := flag.String("addr", ":9101", "RPC listen address")
 	mdsAddr := flag.String("mds", "localhost:9001", "metadata server address")
-	dataDir := flag.String("data-dir", "/tmp/dn1", "local data directory")
+	dataDir := flag.String("datadir", "/tmp/dn1", "local data directory")
 	flag.Parse()
 
 	// Structured logging
