@@ -32,6 +32,13 @@ type FileLocation struct {
 	Status   string    `json:"status"`   // file status: "pending" or "complete"
 }
 
+// NodeFile 是 DataNode 本地磁盘上的文件信息，用于 GC 扫描时汇报给 MDS。
+// 注意：这是物理层视角的文件，与 FileInfo（MDS 逻辑目录树视角）不同。
+type NodeFile struct {
+	Path    string    `json:"path"`     // 虚拟路径（/开头）
+	ModTime time.Time `json:"mod_time"` // 节点本地最后修改时间
+}
+
 // ===== MetadataServer RPC 接口定义 =====
 
 // MetadataService 元数据服务，管理目录树和文件→数据节点的映射。
@@ -111,8 +118,8 @@ type DataService interface {
 	// HealthCheck 健康检查。
 	HealthCheck(_ struct{}, reply *bool) error
 
-	// ListAllPaths 返回该数据节点持有的所有文件相对路径（供 MDS GC 用）。
-	ListAllPaths(_ struct{}, reply *[]string) error
+	// ListAllPaths 返回该数据节点持有的所有文件信息（供 MDS GC 用）。
+	ListAllPaths(_ struct{}, reply *[]NodeFile) error
 }
 
 // StoreArgs 存储数据的请求参数。

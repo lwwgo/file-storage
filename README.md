@@ -120,11 +120,13 @@ CLI usage: `./client put -overwrite local.txt /remote.txt`
 
 The MDS leader runs background GC every 5 minutes (plus manual `gc` command):
 
-1. Walks the metadata tree to collect all valid file paths
-2. Asks each DataNode for all paths it holds
-3. Deletes any DataNode file not referenced by metadata (orphan)
+1. Walks the metadata tree to collect all valid file paths (snapshot at GC start)
+2. Asks each DataNode for all files it holds (path + modification time)
+3. For each DataNode file not referenced by metadata (orphan):
+   - **mtime protection**: skip files modified within the last 30 seconds
+   - Only delete confirmed old orphans
 
-This handles the case where delete operations fail to reach some DataNodes, ensuring eventual disk space reclamation.
+The 30-second safety window prevents a TOCTOU race where files created during the GC scan (after the metadata snapshot but before the DataNode enumeration) would be mistakenly deleted. This handles the case where delete operations fail to reach some DataNodes, ensuring eventual disk space reclamation without risking recently uploaded files.
 
 ### Ghost File Protection
 
@@ -270,7 +272,7 @@ The project depends on [goraft](https://github.com/lwwgo/goraft), a standalone R
 
 7. **File lifecycle with pending/complete state**: Files start in `pending` status after metadata creation and transition to `complete` after successful data upload. Pending files return empty content on reads (like POSIX `creat()`), preventing ghost file errors.
 
-8. **Orphan data garbage collection**: Background GC periodically compares DataNode-held files against metadata tree and cleans up orphans. Manual `gc` command available for on-demand cleanup.
+8. **Orphan data garbage collection**: Background GC periodically compares DataNode-held files against metadata tree and cleans up orphans, with a 30-second mtime safety window to prevent deleting files created during the scan. Manual `gc` command available for on-demand cleanup.
 
 9. **Ghost file protection**: Three-layer defense — client compensation deletion, empty file legality for pending state, and background orphan GC.
 

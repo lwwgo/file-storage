@@ -169,12 +169,12 @@ func (dn *DataNode) HealthCheck(_ struct{}, reply *bool) error {
 	return nil
 }
 
-// ListAllPaths 返回该数据节点持有的所有文件相对路径（供 MDS GC 用）。
-func (dn *DataNode) ListAllPaths(_ struct{}, reply *[]string) error {
+// ListAllPaths 返回该数据节点持有的所有文件元数据（供 MDS GC 用）。
+func (dn *DataNode) ListAllPaths(_ struct{}, reply *[]types.NodeFile) error {
 	dn.mu.RLock()
 	defer dn.mu.RUnlock()
 
-	var paths []string
+	var files []types.NodeFile
 	err := filepath.Walk(dn.dataDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -190,14 +190,17 @@ func (dn *DataNode) ListAllPaths(_ struct{}, reply *[]string) error {
 		if err != nil {
 			return err
 		}
-		// 转为虚拟路径格式（/开头）
-		paths = append(paths, "/"+filepath.ToSlash(rel))
+		// 转为虚拟路径格式（/开头），带上修改时间供 GC mtime 保护用
+		files = append(files, types.NodeFile{
+			Path:    "/" + filepath.ToSlash(rel),
+			ModTime: info.ModTime(),
+		})
 		return nil
 	})
 	if err != nil {
 		return fmt.Errorf("walk data dir failed: %w", err)
 	}
-	*reply = paths
+	*reply = files
 	return nil
 }
 
