@@ -31,7 +31,14 @@ const (
 	OpRegisterDataNode = "register_dn"
 	OpMkdir            = "mkdir"
 	OpCreateFile       = "create_file"
+	OpCompleteFile     = "complete_file"
 	OpDelete           = "delete"
+)
+
+// 文件状态（仅文件节点有效）
+const (
+	StatusPending  = "pending"  // 元数据已创建，数据尚未完全上传
+	StatusComplete = "complete" // 数据已就绪，可读
 )
 
 // commandPayload is the business command payload carried in a Raft log entry.
@@ -55,6 +62,7 @@ type entry struct {
 	mode      uint32
 	createdAt time.Time
 	modTime   time.Time
+	status    string // only for file nodes: "pending" or "complete"
 
 	// Only for file nodes: replica locations on data nodes
 	replicas []types.Replica
@@ -108,6 +116,9 @@ func NewMetadataServer(raftConfig rafttypes.Config, logger *slog.Logger) (*Metad
 
 	// 启动 Raft 选举和心跳定时器（非阻塞）
 	raftNode.Start()
+
+	// 启动后台孤儿数据 GC（仅 leader 实际执行）
+	mds.startGC()
 
 	logger.Info("metadata server with raft initialized",
 		"local_id", raftConfig.LocalID,
@@ -243,6 +254,20 @@ func (mds *MetadataServer) CreateFile(args *types.CreateFileArgs, reply *types.C
 	return nil
 }
 
+// CompleteFile marks a file as complete after data upload finishes.
+func (mds *MetadataServer) CompleteFile(path string, reply *bool) error {
+	if err := mds.checkLeader(); err != nil {
+		return err
+	}
+	payload := &commandPayload{Op: OpCompleteFile, Path: path}
+	if err := mds.submitCommand(payload); err != nil {
+		return err
+	}
+	*reply = true
+	mds.logger.Info("file marked complete via raft", "path", path)
+	return nil
+}
+
 // Delete removes a file or directory.
 func (mds *MetadataServer) Delete(path string, reply *types.DeleteReply) error {
 	if err := mds.checkLeader(); err != nil {
@@ -289,6 +314,7 @@ func (mds *MetadataServer) GetFileLocation(path string, reply *types.FileLocatio
 		return fmt.Errorf("%s is a directory", path)
 	}
 	reply.Replicas = e.replicas
+	reply.Status = e.status
 	return nil
 }
 
@@ -451,6 +477,7 @@ type entrySnapshot struct {
 	Mode      uint32                    `json:"mode"`
 	CreatedAt time.Time                 `json:"created_at"`
 	ModTime   time.Time                 `json:"mod_time"`
+	Status    string                    `json:"status,omitempty"`
 	Replicas  []types.Replica           `json:"replicas,omitempty"`
 	Children  map[string]*entrySnapshot `json:"children,omitempty"`
 }
@@ -463,6 +490,7 @@ func (e *entry) toSnapshot() *entrySnapshot {
 		Mode:      e.mode,
 		CreatedAt: e.createdAt,
 		ModTime:   e.modTime,
+		Status:    e.status,
 		Replicas:  e.replicas,
 	}
 	if e.isDir {
@@ -482,6 +510,7 @@ func (s *entrySnapshot) toEntry() *entry {
 		mode:      s.Mode,
 		createdAt: s.CreatedAt,
 		modTime:   s.ModTime,
+		status:    s.Status,
 		replicas:  s.Replicas,
 	}
 	if s.IsDir {
@@ -492,3 +521,6 @@ func (s *entrySnapshot) toEntry() *entry {
 	}
 	return e
 }
+
+// Compile-time assertion: ensure MetadataServer fully implements MetadataService.
+var _ types.MetadataService = (*MetadataServer)(nil)

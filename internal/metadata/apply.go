@@ -86,9 +86,23 @@ func (mds *MetadataServer) applyCreateFile(p *commandPayload) error {
 		mode:      0644,
 		createdAt: createdAt,
 		modTime:   now,
+		status:    StatusPending,
 		replicas:  p.Replicas,
 	}
 	current.modTime = now
+	return nil
+}
+
+func (mds *MetadataServer) applyCompleteFile(p *commandPayload) error {
+	e := mds.lookup(p.Path)
+	if e == nil {
+		return fmt.Errorf("path not found: %s", p.Path)
+	}
+	if e.isDir {
+		return fmt.Errorf("%s is a directory, cannot complete", p.Path)
+	}
+	e.status = StatusComplete
+	e.modTime = time.Now()
 	return nil
 }
 

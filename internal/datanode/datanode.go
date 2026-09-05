@@ -1,9 +1,9 @@
 // Package datanode 实现分布式文件系统的数据节点。
 //
 // DataNode 职责：
-//   1. 存储实际文件内容（按路径映射到本地磁盘）
-//   2. 启动时向 MDS 注册自己
-//   3. 通过 net/rpc 提供 StoreData/GetData/DeleteData 服务
+//  1. 存储实际文件内容（按路径映射到本地磁盘）
+//  2. 启动时向 MDS 注册自己
+//  3. 通过 net/rpc 提供 StoreData/GetData/DeleteData 服务
 //
 // 注意：DataNode 不管理目录树、不管理文件映射，这些全在 MDS 上。
 package datanode
@@ -22,11 +22,11 @@ import (
 
 // DataNode 是数据节点的核心实现。
 type DataNode struct {
-	dataDir    string       // 本地数据存储根目录
-	mdsAddr    string       // MDS 的 RPC 地址
-	addr       string       // 本节点的 RPC 地址
-	mu         sync.RWMutex // 保护并发写入
-	logger     *slog.Logger
+	dataDir string       // 本地数据存储根目录
+	mdsAddr string       // MDS 的 RPC 地址
+	addr    string       // 本节点的 RPC 地址
+	mu      sync.RWMutex // 保护并发写入
+	logger  *slog.Logger
 }
 
 // NewDataNode 创建数据节点实例。
@@ -169,6 +169,38 @@ func (dn *DataNode) HealthCheck(_ struct{}, reply *bool) error {
 	return nil
 }
 
+// ListAllPaths 返回该数据节点持有的所有文件相对路径（供 MDS GC 用）。
+func (dn *DataNode) ListAllPaths(_ struct{}, reply *[]string) error {
+	dn.mu.RLock()
+	defer dn.mu.RUnlock()
+
+	var paths []string
+	err := filepath.Walk(dn.dataDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		// 跳过临时文件
+		if strings.HasSuffix(path, ".tmp") {
+			return nil
+		}
+		rel, err := filepath.Rel(dn.dataDir, path)
+		if err != nil {
+			return err
+		}
+		// 转为虚拟路径格式（/开头）
+		paths = append(paths, "/"+filepath.ToSlash(rel))
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("walk data dir failed: %w", err)
+	}
+	*reply = paths
+	return nil
+}
+
 // resolvePath 把虚拟路径解析为本地磁盘路径，并做路径穿越防护。
 func (dn *DataNode) resolvePath(remotePath string) (string, error) {
 	// 禁止路径穿越
@@ -179,3 +211,6 @@ func (dn *DataNode) resolvePath(remotePath string) (string, error) {
 	realPath := filepath.Join(dn.dataDir, clean)
 	return realPath, nil
 }
+
+// Compile-time assertion: ensure DataNode fully implements DataService.
+var _ types.DataService = (*DataNode)(nil)

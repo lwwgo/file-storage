@@ -7,13 +7,14 @@
 // Commands:
 //
 //	mkdir <path>                    Create directory
-//	put <local> <remote>            Upload file
+//	put [-overwrite] <local> <remote> Upload file
 //	get <remote> <local>            Download file
 //	ls [path]                       List directory (default: /)
 //	stat <path>                     Show file/directory info
 //	rm <path>                       Delete file/directory
 //	replicas <path>                 Show file's replica locations
 //	nodes                           List registered data nodes
+//	gc                              Trigger orphan data garbage collection
 package main
 
 import (
@@ -25,6 +26,7 @@ import (
 	"time"
 
 	"github.com/lwwgo/file-storage/internal/client"
+	"github.com/lwwgo/file-storage/internal/types"
 )
 
 func main() {
@@ -58,15 +60,23 @@ func main() {
 		fmt.Printf("✓ Directory created: %s\n", args[1])
 
 	case "put":
-		if len(args) < 3 {
-			fmt.Println("Usage: client put <local> <remote>")
+		fs := flag.NewFlagSet("put", flag.ExitOnError)
+		overwrite := fs.Bool("overwrite", false, "overwrite if file already exists")
+		fs.Parse(args[1:])
+		putArgs := fs.Args()
+		if len(putArgs) < 2 {
+			fmt.Println("Usage: client put [-overwrite] <local> <remote>")
 			os.Exit(1)
 		}
-		if err := c.PutFile(args[1], args[2]); err != nil {
+		var putOpts []client.PutOption
+		if *overwrite {
+			putOpts = append(putOpts, client.WithCreateMode(types.OverwriteIfExists))
+		}
+		if err := c.PutFile(putArgs[0], putArgs[1], putOpts...); err != nil {
 			logger.Error("put failed", "error", err)
 			os.Exit(1)
 		}
-		fmt.Printf("✓ File uploaded: %s → %s\n", args[1], args[2])
+		fmt.Printf("✓ File uploaded: %s → %s\n", putArgs[0], putArgs[1])
 
 	case "get":
 		if len(args) < 3 {
@@ -161,6 +171,13 @@ func main() {
 			fmt.Printf("  - %s\n", n)
 		}
 
+	case "gc":
+		if err := c.TriggerGC(); err != nil {
+			logger.Error("trigger GC failed", "error", err)
+			os.Exit(1)
+		}
+		fmt.Println("✓ GC triggered in background (check MDS logs for results)")
+
 	default:
 		fmt.Printf("Unknown command: %s\n\n", cmd)
 		printUsage()
@@ -175,11 +192,12 @@ func printUsage() {
 	fmt.Println()
 	fmt.Println("Commands:")
 	fmt.Println("  mkdir <path>                    Create directory")
-	fmt.Println("  put <local> <remote>            Upload file")
+	fmt.Println("  put [-overwrite] <local> <remote> Upload file (-overwrite to overwrite existing)")
 	fmt.Println("  get <remote> <local>            Download file")
 	fmt.Println("  ls [path]                       List directory (default: /)")
 	fmt.Println("  stat <path>                     Show file/directory info")
 	fmt.Println("  rm <path>                       Delete file/directory")
 	fmt.Println("  replicas <path>                 Show file's replica locations")
 	fmt.Println("  nodes                           List registered data nodes")
+	fmt.Println("  gc                              Trigger orphan data garbage collection")
 }
