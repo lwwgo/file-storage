@@ -10,6 +10,7 @@ package datanode
 
 import (
 	"fmt"
+	"io"
 	"log/slog"
 	"net/rpc"
 	"os"
@@ -221,6 +222,126 @@ func (dn *DataNode) ListAllPaths(_ struct{}, reply *[]types.NodeFile) error {
 		return fmt.Errorf("walk data dir failed: %w", err)
 	}
 	*reply = files
+	return nil
+}
+
+// RangeRead 随机读取：从 offset 读最多 Length 字节。
+// 到达文件末尾时返回 EOF=true（data 可能为空），不返回错误（FUSE 依赖此语义）。
+func (dn *DataNode) RangeRead(args *types.RangeReadArgs, reply *types.RangeReadReply) error {
+	dn.mu.RLock()
+	defer dn.mu.RUnlock()
+
+	realPath, err := dn.resolvePath(args.Path)
+	if err != nil {
+		return err
+	}
+
+	f, err := os.Open(realPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// 空文件是合法状态（O_CREAT 后未写数据）：返回空 data + EOF，不报错。
+			reply.Data = []byte{}
+			reply.EOF = true
+			return nil
+		}
+		return fmt.Errorf("failed to open data: %w", err)
+	}
+	defer f.Close()
+
+	buf := make([]byte, args.Length)
+	n, err := f.ReadAt(buf, args.Offset)
+	if err != nil && err != io.EOF {
+		return fmt.Errorf("failed to read range: %w", err)
+	}
+	reply.Data = buf[:n]
+	// io.EOF or short read means we reached/passed end of file.
+	if err == io.EOF || n < int(args.Length) {
+		reply.EOF = true
+	}
+	dn.logger.Debug("range read", "path", args.Path, "offset", args.Offset, "length", args.Length, "read", n, "eof", reply.EOF)
+	return nil
+}
+
+// PartialWrite 随机写入：向 offset 写入 Data，支持 sparse file。
+func (dn *DataNode) PartialWrite(args *types.PartialWriteArgs, reply *bool) error {
+	dn.mu.Lock()
+	defer dn.mu.Unlock()
+
+	realPath, err := dn.resolvePath(args.Path)
+	if err != nil {
+		return err
+	}
+
+	// 确保父目录存在
+	if err := os.MkdirAll(filepath.Dir(realPath), 0755); err != nil {
+		return fmt.Errorf("failed to create parent dir: %w", err)
+	}
+
+	// O_WRONLY|O_CREATE: Go 的 WriteAt 天然支持 sparse file（offset 超过文件大小时中间补 0）
+	f, err := os.OpenFile(realPath, os.O_WRONLY|os.O_CREATE, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open data for write: %w", err)
+	}
+	defer f.Close()
+
+	n, err := f.WriteAt(args.Data, args.Offset)
+	if err != nil {
+		return fmt.Errorf("failed to write range: %w", err)
+	}
+	if n != len(args.Data) {
+		return fmt.Errorf("partial write short: wrote %d, expected %d", n, len(args.Data))
+	}
+
+	*reply = true
+	dn.logger.Debug("partial write", "path", args.Path, "offset", args.Offset, "length", len(args.Data))
+	return nil
+}
+
+// Truncate 调整文件大小：缩小丢弃尾部，扩大补 0。
+func (dn *DataNode) Truncate(args *types.TruncateArgs, reply *bool) error {
+	dn.mu.Lock()
+	defer dn.mu.Unlock()
+
+	realPath, err := dn.resolvePath(args.Path)
+	if err != nil {
+		return err
+	}
+
+	// 文件不存在时，truncate 到非 0 大小会创建 sparse 文件；truncate 到 0 则无操作（幂等）
+	if err := os.Truncate(realPath, args.Size); err != nil {
+		return fmt.Errorf("failed to truncate data: %w", err)
+	}
+
+	*reply = true
+	dn.logger.Info("data truncated", "path", args.Path, "size", args.Size)
+	return nil
+}
+
+// Sync 强制 fsync 确保持久化。net/rpc 无状态，每次重新打开文件句柄。
+func (dn *DataNode) Sync(args *types.SyncArgs, reply *bool) error {
+	dn.mu.Lock()
+	defer dn.mu.Unlock()
+
+	realPath, err := dn.resolvePath(args.Path)
+	if err != nil {
+		return err
+	}
+
+	f, err := os.OpenFile(realPath, os.O_RDWR, 0644)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("data not found: %s", args.Path)
+		}
+		return fmt.Errorf("failed to open data for sync: %w", err)
+	}
+	defer f.Close()
+
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("failed to sync data: %w", err)
+	}
+
+	*reply = true
+	dn.logger.Debug("data synced", "path", args.Path)
 	return nil
 }
 
