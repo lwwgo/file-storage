@@ -243,13 +243,13 @@ go build -o bin/fstorex ./cmd/fstorex
 
 ```bash
 # 1. Start 3 MDS nodes (Raft cluster)
-./bin/fstorex-metadata -id=localhost:9001 -peers=localhost:9002,localhost:9003 -wal-dir=/tmp/mds1/wal -snap-dir=/tmp/mds1/snap
-./bin/fstorex-metadata -id=localhost:9002 -peers=localhost:9001,localhost:9003 -wal-dir=/tmp/mds2/wal -snap-dir=/tmp/mds2/snap
-./bin/fstorex-metadata -id=localhost:9003 -peers=localhost:9001,localhost:9002 -wal-dir=/tmp/mds3/wal -snap-dir=/tmp/mds3/snap
+./bin/fstorex-metadata -id=localhost:9001 -peers=localhost:9002,localhost:9003 -waldir=/tmp/mds1/wal -snapdir=/tmp/mds1/snap
+./bin/fstorex-metadata -id=localhost:9002 -peers=localhost:9001,localhost:9003 -waldir=/tmp/mds2/wal -snapdir=/tmp/mds2/snap
+./bin/fstorex-metadata -id=localhost:9003 -peers=localhost:9001,localhost:9002 -waldir=/tmp/mds3/wal -snapdir=/tmp/mds3/snap
 
 # 2. Start data nodes (connect to any MDS; auto-redirects to leader)
-./bin/fstorex-datanode -addr=:9101 -mds=localhost:9001 -data-dir=/tmp/dn1
-./bin/fstorex-datanode -addr=:9102 -mds=localhost:9001 -data-dir=/tmp/dn2
+./bin/fstorex-datanode -addr=:9101 -mds=localhost:9001 -datadir=/tmp/dn1
+./bin/fstorex-datanode -addr=:9102 -mds=localhost:9001 -datadir=/tmp/dn2
 
 # 3. Use the client (connect to any MDS)
 ./bin/fstorex -mds=localhost:9001 nodes

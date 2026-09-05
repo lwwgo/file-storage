@@ -7,11 +7,11 @@
 // Usage (3-node cluster):
 //
 //	# Node 1
-//	./fstorex-metadata -id=localhost:9001 -peers=localhost:9002,localhost:9003 -wal-dir=/tmp/mds1/wal -snap-dir=/tmp/mds1/snap
+//	./fstorex-metadata -id=localhost:9001 -peers=localhost:9002,localhost:9003 -waldir=/tmp/mds1/wal -snapdir=/tmp/mds1/snap
 //	# Node 2
-//	./fstorex-metadata -id=localhost:9002 -peers=localhost:9001,localhost:9003 -wal-dir=/tmp/mds2/wal -snap-dir=/tmp/mds2/snap
+//	./fstorex-metadata -id=localhost:9002 -peers=localhost:9001,localhost:9003 -waldir=/tmp/mds2/wal -snapdir=/tmp/mds2/snap
 //	# Node 3
-//	./fstorex-metadata -id=localhost:9003 -peers=localhost:9001,localhost:9002 -wal-dir=/tmp/mds3/wal -snap-dir=/tmp/mds3/snap
+//	./fstorex-metadata -id=localhost:9003 -peers=localhost:9001,localhost:9002 -waldir=/tmp/mds3/wal -snapdir=/tmp/mds3/snap
 //
 // Clients may connect to any node: write operations are automatically forwarded to the leader, while reads can be served by any node.
 package main
@@ -35,9 +35,9 @@ import (
 func main() {
 	id := flag.String("id", "localhost:9001", "this node's Raft ID, also the business RPC listen address (e.g. localhost:9001)")
 	peersStr := flag.String("peers", "", "other node addresses, comma-separated (e.g. localhost:9002,localhost:9003)")
-	walDir := flag.String("wal-dir", "/tmp/mds/wal", "Raft WAL log directory")
-	snapDir := flag.String("snap-dir", "/tmp/mds/snap", "Raft snapshot directory")
-	maxIndexSpan := flag.Uint64("max-index-span", 1000, "snapshot trigger threshold (take snapshot when log count exceeds this value)")
+	walDir := flag.String("waldir", "/tmp/mds/wal", "Raft WAL log directory")
+	snapDir := flag.String("snapdir", "/tmp/mds/snap", "Raft snapshot directory")
+	maxIndexSpan := flag.Uint64("maxindexspan", 1000, "snapshot trigger threshold (take snapshot when log count exceeds this value)")
 	flag.Parse()
 
 	// Structured logging
