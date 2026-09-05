@@ -32,12 +32,12 @@ if [[ "${1:-}" == "clean" ]]; then
 fi
 
 # 检查是否已构建
-if [[ ! -f "$BIN_DIR/metadata-server" || ! -f "$BIN_DIR/data-node" || ! -f "$BIN_DIR/client" ]]; then
+if [[ ! -f "$BIN_DIR/fstorex-metadata" || ! -f "$BIN_DIR/fstorex-datanode" || ! -f "$BIN_DIR/fstorex" ]]; then
     log "binaries not found, building..."
     mkdir -p "$BIN_DIR"
-    (cd "$SCRIPT_DIR" && go build -o "$BIN_DIR/metadata-server" ./cmd/metadata-server)
-    (cd "$SCRIPT_DIR" && go build -o "$BIN_DIR/data-node" ./cmd/data-node)
-    (cd "$SCRIPT_DIR" && go build -o "$BIN_DIR/client" ./cmd/client)
+    (cd "$SCRIPT_DIR" && go build -o "$BIN_DIR/fstorex-metadata" ./cmd/fstorex-metadata)
+    (cd "$SCRIPT_DIR" && go build -o "$BIN_DIR/fstorex-datanode" ./cmd/fstorex-datanode)
+    (cd "$SCRIPT_DIR" && go build -o "$BIN_DIR/fstorex" ./cmd/fstorex)
 fi
 
 # 清理旧数据
@@ -50,17 +50,17 @@ mkdir -p "$DATA_ROOT/dn1" "$DATA_ROOT/dn2"
 
 # 启动 3 个 MDS 节点（Raft 集群）
 log "starting metadata server 1 (localhost:9001)..."
-"$BIN_DIR/metadata-server" -id=localhost:9001 -peers=localhost:9002,localhost:9003 \
+"$BIN_DIR/fstorex-metadata" -id=localhost:9001 -peers=localhost:9002,localhost:9003 \
     -wal-dir="$DATA_ROOT/mds1/wal" -snap-dir="$DATA_ROOT/mds1/snap" > "$DATA_ROOT/mds1.log" 2>&1 &
 echo $! >> "$DATA_ROOT/.pids"
 
 log "starting metadata server 2 (localhost:9002)..."
-"$BIN_DIR/metadata-server" -id=localhost:9002 -peers=localhost:9001,localhost:9003 \
+"$BIN_DIR/fstorex-metadata" -id=localhost:9002 -peers=localhost:9001,localhost:9003 \
     -wal-dir="$DATA_ROOT/mds2/wal" -snap-dir="$DATA_ROOT/mds2/snap" > "$DATA_ROOT/mds2.log" 2>&1 &
 echo $! >> "$DATA_ROOT/.pids"
 
 log "starting metadata server 3 (localhost:9003)..."
-"$BIN_DIR/metadata-server" -id=localhost:9003 -peers=localhost:9001,localhost:9002 \
+"$BIN_DIR/fstorex-metadata" -id=localhost:9003 -peers=localhost:9001,localhost:9002 \
     -wal-dir="$DATA_ROOT/mds3/wal" -snap-dir="$DATA_ROOT/mds3/snap" > "$DATA_ROOT/mds3.log" 2>&1 &
 echo $! >> "$DATA_ROOT/.pids"
 
@@ -70,11 +70,11 @@ sleep 5
 
 # 启动 2 个 DataNode（连任意 MDS 节点，会自动重定向到 leader）
 log "starting data node 1 on :9101..."
-"$BIN_DIR/data-node" -addr=:9101 -mds=localhost:9001 -data-dir="$DATA_ROOT/dn1" > "$DATA_ROOT/dn1.log" 2>&1 &
+"$BIN_DIR/fstorex-datanode" -addr=:9101 -mds=localhost:9001 -data-dir="$DATA_ROOT/dn1" > "$DATA_ROOT/dn1.log" 2>&1 &
 echo $! >> "$DATA_ROOT/.pids"
 
 log "starting data node 2 on :9102..."
-"$BIN_DIR/data-node" -addr=:9102 -mds=localhost:9001 -data-dir="$DATA_ROOT/dn2" > "$DATA_ROOT/dn2.log" 2>&1 &
+"$BIN_DIR/fstorex-datanode" -addr=:9102 -mds=localhost:9001 -data-dir="$DATA_ROOT/dn2" > "$DATA_ROOT/dn2.log" 2>&1 &
 echo $! >> "$DATA_ROOT/.pids"
 sleep 2
 
@@ -87,21 +87,21 @@ echo ""
 
 # 1. 查看数据节点
 log "1. List registered data nodes (via $MDS)"
-"$BIN_DIR/client" -mds="$MDS" nodes
+"$BIN_DIR/fstorex" -mds="$MDS" nodes
 
 # 2. 创建目录
 echo ""
 log "2. Create directories"
-"$BIN_DIR/client" -mds="$MDS" mkdir /docs
-"$BIN_DIR/client" -mds="$MDS" mkdir /images
+"$BIN_DIR/fstorex" -mds="$MDS" mkdir /docs
+"$BIN_DIR/fstorex" -mds="$MDS" mkdir /images
 
 # 3. 上传文件
 echo ""
 log "3. Upload files"
 echo "Hello FStoreX! This is a Raft HA demo." > "$DATA_ROOT/test-upload.txt"
 echo -n "FAKE_PNG_DATA_123456" > "$DATA_ROOT/test-image.bin"
-"$BIN_DIR/client" -mds="$MDS" put "$DATA_ROOT/test-upload.txt" /docs/readme.md
-"$BIN_DIR/client" -mds="$MDS" put "$DATA_ROOT/test-image.bin" /images/logo.png
+"$BIN_DIR/fstorex" -mds="$MDS" put "$DATA_ROOT/test-upload.txt" /docs/readme.md
+"$BIN_DIR/fstorex" -mds="$MDS" put "$DATA_ROOT/test-image.bin" /images/logo.png
 
 # Give Raft time to replicate logs to followers before read tests
 sleep 2
@@ -109,26 +109,26 @@ sleep 2
 # 4. 列出目录
 echo ""
 log "4. List root directory"
-"$BIN_DIR/client" -mds="$MDS" ls /
+"$BIN_DIR/fstorex" -mds="$MDS" ls /
 
 echo ""
 log "5. List /docs directory"
-"$BIN_DIR/client" -mds="$MDS" ls /docs
+"$BIN_DIR/fstorex" -mds="$MDS" ls /docs
 
 # 5. stat
 echo ""
 log "6. Stat a file"
-"$BIN_DIR/client" -mds="$MDS" stat /docs/readme.md
+"$BIN_DIR/fstorex" -mds="$MDS" stat /docs/readme.md
 
 # 6. 查看副本分布
 echo ""
 log "7. Show replica locations for /docs/readme.md"
-"$BIN_DIR/client" -mds="$MDS" replicas /docs/readme.md
+"$BIN_DIR/fstorex" -mds="$MDS" replicas /docs/readme.md
 
 # 7. 下载
 echo ""
 log "8. Download file"
-"$BIN_DIR/client" -mds="$MDS" get /docs/readme.md "$DATA_ROOT/downloaded.txt"
+"$BIN_DIR/fstorex" -mds="$MDS" get /docs/readme.md "$DATA_ROOT/downloaded.txt"
 echo "   Downloaded content: $(cat "$DATA_ROOT/downloaded.txt")"
 
 # 8. 物理分布（验证文件存在于多个 DataNode）
@@ -151,17 +151,17 @@ fi
 # 10. 删除
 echo ""
 log "10. Delete a file"
-"$BIN_DIR/client" -mds="$MDS" rm /images/logo.png
+"$BIN_DIR/fstorex" -mds="$MDS" rm /images/logo.png
 sleep 1
-"$BIN_DIR/client" -mds="$MDS" ls /images
+"$BIN_DIR/fstorex" -mds="$MDS" ls /images
 
 # 11. 验证从不同 MDS 节点读（follower 也能读）
 echo ""
 log "11. Read from different MDS node (localhost:9002, should also work)"
-"$BIN_DIR/client" -mds=localhost:9002 ls /docs
+"$BIN_DIR/fstorex" -mds=localhost:9002 ls /docs
 
 echo ""
 echo -e "${GREEN}========== Demo completed successfully ==========${NC}"
 echo ""
 log "running processes (use './start.sh clean' to stop):"
-ps aux | grep -E 'metadata-server|data-node' | grep -v grep | awk '{print "  " $11, $12, $13, $14}'
+ps aux | grep -E 'fstorex-metadata|fstorex-datanode' | grep -v grep | awk '{print "  " $11, $12, $13, $14}'

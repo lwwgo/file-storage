@@ -1,8 +1,8 @@
-// data-node is the data node binary for the distributed file system.
+// fstorex-datanode is the data node binary for the distributed file system.
 //
 // Usage:
 //
-//	./data-node -addr=:9101 -mds=localhost:9001 -data-dir=/tmp/dn1
+//	./fstorex-datanode -addr=:9101 -mds=localhost:9001 -data-dir=/tmp/dn1
 //
 // Responsibility: stores actual file content and registers itself with MDS on startup.
 package main
