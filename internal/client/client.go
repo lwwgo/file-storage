@@ -104,9 +104,8 @@ func (c *Client) PutFile(localPath, remotePath string) error {
 
 	// 2. RPC MDS create file metadata, get all replica locations (auto-redirect to leader)
 	createArgs := &types.CreateFileArgs{
-		Path:    remotePath,
-		Size:    int64(len(content)),
-		Content: "application/octet-stream",
+		Path: remotePath,
+		Size: int64(len(content)),
 	}
 	var createReply types.CreateFileReply
 	if err := c.callMDSWithRedirect("MetadataService.CreateFile", createArgs, &createReply); err != nil {

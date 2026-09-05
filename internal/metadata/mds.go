@@ -38,12 +38,13 @@ const (
 // All fields are JSON-serialized into CommandEntry.Data, ensuring all replicas
 // apply the same commands in the same order for state machine consistency.
 type commandPayload struct {
-	Op       string          `json:"op"`
-	Path     string          `json:"path,omitempty"`
-	Addr     string          `json:"addr,omitempty"` // register_dn: data node address
-	Size     int64           `json:"size,omitempty"` // create_file: file size
-	Replicas []types.Replica `json:"replicas,omitempty"`
-	IsDir    bool            `json:"is_dir,omitempty"` // delete: whether the target is a directory
+	Op         string           `json:"op"`
+	Path       string           `json:"path,omitempty"`
+	Addr       string           `json:"addr,omitempty"` // register_dn: data node address
+	Size       int64            `json:"size,omitempty"` // create_file: file size
+	Replicas   []types.Replica  `json:"replicas,omitempty"`
+	IsDir      bool             `json:"is_dir,omitempty"`      // delete: whether the target is a directory
+	CreateMode types.CreateMode `json:"create_mode,omitempty"` // create_file: behavior when file exists
 }
 
 // entry is a node in the directory tree (file or directory).
@@ -227,10 +228,11 @@ func (mds *MetadataServer) CreateFile(args *types.CreateFileArgs, reply *types.C
 	mds.mu.RUnlock()
 
 	payload := &commandPayload{
-		Op:       OpCreateFile,
-		Path:     args.Path,
-		Size:     args.Size,
-		Replicas: replicas,
+		Op:         OpCreateFile,
+		Path:       args.Path,
+		Size:       args.Size,
+		Replicas:   replicas,
+		CreateMode: args.CreateMode,
 	}
 	if err := mds.submitCommand(payload); err != nil {
 		return err
@@ -351,154 +353,6 @@ func (mds *MetadataServer) ListDataNodes(_ struct{}, reply *[]string) error {
 	mds.mu.RLock()
 	defer mds.mu.RUnlock()
 	*reply = mds.dataNodes
-	return nil
-}
-
-// ===== 实现 goraft StateMachine 接口 =====
-
-// Apply 应用一条已提交的日志命令到本地状态机。
-// 此方法由 Raft 保证在所有节点上以相同顺序调用，且仅做确定性的内存修改。
-func (mds *MetadataServer) Apply(op string, data []byte) error {
-	var payload commandPayload
-	if err := json.Unmarshal(data, &payload); err != nil {
-		return fmt.Errorf("unmarshal command payload failed: %w", err)
-	}
-
-	mds.mu.Lock()
-	defer mds.mu.Unlock()
-
-	switch op {
-	case OpRegisterDataNode:
-		return mds.applyRegisterDataNode(&payload)
-	case OpMkdir:
-		return mds.applyMkdir(&payload)
-	case OpCreateFile:
-		return mds.applyCreateFile(&payload)
-	case OpDelete:
-		return mds.applyDelete(&payload)
-	default:
-		return fmt.Errorf("unknown command op: %s", op)
-	}
-}
-
-// Snapshot 生成当前状态机的快照数据（供 Raft 压缩日志用）。
-func (mds *MetadataServer) Snapshot() ([]byte, error) {
-	mds.mu.RLock()
-	defer mds.mu.RUnlock()
-	snap := metaSnapshot{
-		Root:      mds.root.toSnapshot(),
-		DataNodes: mds.dataNodes,
-	}
-	return json.Marshal(snap)
-}
-
-// Restore 从快照数据恢复状态机（Raft 节点启动时调用）。
-func (mds *MetadataServer) Restore(data []byte) error {
-	if len(data) == 0 {
-		return nil
-	}
-	var snap metaSnapshot
-	if err := json.Unmarshal(data, &snap); err != nil {
-		return fmt.Errorf("unmarshal snapshot failed: %w", err)
-	}
-	mds.mu.Lock()
-	defer mds.mu.Unlock()
-	mds.root = snap.toEntry()
-	mds.dataNodes = snap.DataNodes
-	mds.logger.Info("state machine restored from snapshot", "data_nodes", len(mds.dataNodes))
-	return nil
-}
-
-// ===== Apply 内部实现（仅做内存修改，不涉及共识）=====
-
-func (mds *MetadataServer) applyRegisterDataNode(p *commandPayload) error {
-	for _, a := range mds.dataNodes {
-		if a == p.Addr {
-			return nil // 幂等
-		}
-	}
-	mds.dataNodes = append(mds.dataNodes, p.Addr)
-	return nil
-}
-
-func (mds *MetadataServer) applyMkdir(p *commandPayload) error {
-	parts := splitPath(p.Path)
-	current := mds.root
-	now := time.Now()
-	for i, part := range parts {
-		child, exists := current.children[part]
-		if !exists {
-			child = &entry{
-				name:      part,
-				isDir:     true,
-				mode:      0755,
-				createdAt: now,
-				modTime:   now,
-				children:  make(map[string]*entry),
-			}
-			current.children[part] = child
-			current.modTime = now
-		} else if !child.isDir {
-			return fmt.Errorf("%s is not a directory (at level %d: %s)", p.Path, i, part)
-		}
-		current = child
-	}
-	return nil
-}
-
-func (mds *MetadataServer) applyCreateFile(p *commandPayload) error {
-	parts := splitPath(p.Path)
-	if len(parts) == 0 {
-		return fmt.Errorf("invalid path: %s", p.Path)
-	}
-	dirParts := parts[:len(parts)-1]
-	fileName := parts[len(parts)-1]
-
-	current := mds.root
-	for _, part := range dirParts {
-		child, exists := current.children[part]
-		if !exists || !child.isDir {
-			return fmt.Errorf("parent directory not found: %s", p.Path)
-		}
-		current = child
-	}
-
-	now := time.Now()
-	current.children[fileName] = &entry{
-		name:      fileName,
-		isDir:     false,
-		size:      p.Size,
-		mode:      0644,
-		createdAt: now,
-		modTime:   now,
-		replicas:  p.Replicas,
-	}
-	current.modTime = now
-	return nil
-}
-
-func (mds *MetadataServer) applyDelete(p *commandPayload) error {
-	parts := splitPath(p.Path)
-	if len(parts) == 0 {
-		return fmt.Errorf("cannot delete root")
-	}
-	dirParts := parts[:len(parts)-1]
-	fileName := parts[len(parts)-1]
-
-	current := mds.root
-	for _, part := range dirParts {
-		child, exists := current.children[part]
-		if !exists || !child.isDir {
-			return fmt.Errorf("path not found: %s", p.Path)
-		}
-		current = child
-	}
-
-	if _, exists := current.children[fileName]; !exists {
-		return fmt.Errorf("path not found: %s", p.Path)
-	}
-	delete(current.children, fileName)
-	current.modTime = time.Now()
 	return nil
 }
 
