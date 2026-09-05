@@ -3,6 +3,7 @@ package metadata
 import (
 	"encoding/json"
 	"fmt"
+	"time"
 )
 
 // Apply 应用一条已提交的日志命令到本地状态机。
@@ -17,8 +18,10 @@ func (mds *MetadataServer) Apply(op string, data []byte) error {
 	defer mds.mu.Unlock()
 
 	switch op {
-	case OpRegisterDataNode:
-		return mds.applyRegisterDataNode(&payload)
+	case OpHeartbeat:
+		return mds.applyHeartbeat(&payload)
+	case OpRemoveDataNode:
+		return mds.applyRemoveDataNode(&payload)
 	case OpMkdir:
 		return mds.applyMkdir(&payload)
 	case OpCreateFile:
@@ -37,8 +40,9 @@ func (mds *MetadataServer) Snapshot() ([]byte, error) {
 	mds.mu.RLock()
 	defer mds.mu.RUnlock()
 	snap := metaSnapshot{
-		Root:      mds.root.toSnapshot(),
-		DataNodes: mds.dataNodes,
+		Root:          mds.root.toSnapshot(),
+		DataNodes:     mds.dataNodes,
+		LastHeartbeat: mds.lastHeartbeat,
 	}
 	return json.Marshal(snap)
 }
@@ -56,6 +60,11 @@ func (mds *MetadataServer) Restore(data []byte) error {
 	defer mds.mu.Unlock()
 	mds.root = snap.toEntry()
 	mds.dataNodes = snap.DataNodes
+	if snap.LastHeartbeat != nil {
+		mds.lastHeartbeat = snap.LastHeartbeat
+	} else {
+		mds.lastHeartbeat = make(map[string]time.Time)
+	}
 	mds.logger.Info("state machine restored from snapshot", "data_nodes", len(mds.dataNodes))
 	return nil
 }

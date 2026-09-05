@@ -16,9 +16,13 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/lwwgo/file-storage/internal/types"
 )
+
+// heartbeatInterval is how often the DataNode sends a heartbeat to MDS.
+const heartbeatInterval = 5 * time.Minute
 
 // DataNode 是数据节点的核心实现。
 type DataNode struct {
@@ -49,30 +53,46 @@ func (dn *DataNode) RegisterRPC() error {
 	return rpc.RegisterName("DataService", dn)
 }
 
-// RegisterToMDS 启动时向 MDS 注册自己（自动处理 follower→leader 重定向）。
-func (dn *DataNode) RegisterToMDS() error {
+// StartHeartbeat starts the background heartbeat goroutine.
+// The first heartbeat registers the DataNode; subsequent heartbeats keep it alive.
+// Supports automatic follower→leader redirect for each heartbeat.
+func (dn *DataNode) StartHeartbeat() {
+	// 立即发第一次心跳（即注册）
+	dn.sendHeartbeat()
+	go func() {
+		ticker := time.NewTicker(heartbeatInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			dn.sendHeartbeat()
+		}
+	}()
+	dn.logger.Info("heartbeat goroutine started", "interval", heartbeatInterval)
+}
+
+// sendHeartbeat sends one heartbeat with leader redirect support.
+func (dn *DataNode) sendHeartbeat() {
 	addr := dn.mdsAddr
 	for retries := 0; retries < 3; retries++ {
 		rpcClient, err := rpc.Dial("tcp", addr)
 		if err != nil {
-			return fmt.Errorf("failed to connect to MDS at %s: %w", addr, err)
+			dn.logger.Warn("heartbeat: cannot connect to MDS", "addr", addr, "error", err)
+			return
 		}
-		var reply bool
-		err = rpcClient.Call("MetadataService.RegisterDataNode", dn.addr, &reply)
+		var reply types.HeartbeatReply
+		err = rpcClient.Call("MetadataService.Heartbeat", dn.addr, &reply)
 		rpcClient.Close()
 		if err == nil {
-			dn.logger.Info("registered to metadata server", "mds_addr", addr, "self_addr", dn.addr)
-			return nil
+			return
 		}
 		// follower 重定向
 		if leader := extractLeaderAddr(err.Error()); leader != "" && leader != addr {
-			dn.logger.Info("not leader, redirecting", "from", addr, "to", leader)
+			dn.logger.Info("heartbeat: not leader, redirecting", "from", addr, "to", leader)
 			addr = leader
 			continue
 		}
-		return fmt.Errorf("failed to register with MDS: %w", err)
+		dn.logger.Warn("heartbeat failed", "addr", addr, "error", err)
+		return
 	}
-	return fmt.Errorf("register retries exhausted")
 }
 
 // extractLeaderAddr 从 "not leader, redirect to <addr>" 错误中提取 leader 地址。

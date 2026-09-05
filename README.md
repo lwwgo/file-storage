@@ -4,48 +4,18 @@ A distributed file storage system providing a Unix-like hierarchical directory t
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                            Client (CLI)                              │
-│  put/get/ls/mkdir/rm/stat/replicas/nodes/gc                          │
-│  Writes auto-redirect to leader, reads served by any node           │
-└──────────────┬──────────────────────────┬───────────────────────────┘
-               │                          │
-        Metadata RPC                   Data RPC
-               │                          │
-               ▼                          ▼
-┌───────────────────────────────┐       ┌───────────────────────┐
-│   Metadata Server Cluster     │       │     Data Node         │
-│   (3-node Raft, 1 leader,     │       │   (multiple,          │
-│    2 followers)               │       │    horizontally       │
-│                               │       │     scalable)         │
-│  ┌───────┐  ┌───────┐  ┌────┐│       │  ┌─────────────────┐  │
-│  │ MDS1  │  │ MDS2  │  │MDS3││       │  │  File content    │  │
-│  │Leader │  │Follow │  │Fol ││       │  │  storage         │  │
-│  └───┬───┘  └───┬───┘  └─┬──┘│       │  │  /dn1/docs/...   │  │
-│      │          │        │   │       │  │  /dn2/images/..  │  │
-│      └──── Raft log replication ┘    │  └─────────────────┘  │
-│                               │       │                       │
-│  ┌─────────────────────────┐ │       │  Stores actual        │
-│  │  Directory tree          │ │       │  file content only;   │
-│  │  (Raft state machine)   │ │       │  does not manage       │
-│  │  /docs/readme           │ │       │  the directory tree    │
-│  │  /images/logo           │ │       │                       │
-│  └─────────────────────────┘ │       └───────────────────────┘
-│  ┌─────────────────────────┐ │
-│  │ File → DataNode mapping │ │
-│  │ Multi-replica support   │ │
-│  │ (default 3 replicas)    │ │
-│  └─────────────────────────┘ │
-└───────────────────────────────┘
-```
+<img src="docs/architecture.svg" alt="Architecture" width="1000">
+
+> **Color legend:** 🟩 Client layer · 🟥 MDS Leader · 🟦 MDS Followers · 🟪 Raft State Machine · 🟨 DataNodes
+>
+> DataNodes store actual file content only; they do not manage the directory tree. All text size matches the README body text (16px).
 
 ### Raft High Availability Mechanisms
 
 | Mechanism | Description |
 |---|---|
 | **Leader Election** | 3 MDS nodes elect a leader via Raft; the rest become followers |
-| **Log Replication** | Write operations (Mkdir/CreateFile/CompleteFile/Delete/RegisterDataNode) are submitted by the leader to Raft, replicated to a majority, then applied to the state machine |
+| **Log Replication** | Write operations (Mkdir/CreateFile/CompleteFile/Delete/Heartbeat/RemoveDataNode) are submitted by the leader to Raft, replicated to a majority, then applied to the state machine |
 | **Local Reads** | Read operations (ListDir/Stat/GetFileLocation) are served directly from each node's local state machine replica |
 | **Follower Redirect** | When a follower receives a write request, it returns the leader address; the client automatically retries against the leader |
 | **Failover** | After a leader failure, remaining nodes automatically re-elect; no data loss |
@@ -55,34 +25,64 @@ A distributed file storage system providing a Unix-like hierarchical directory t
 
 | Component | Binary | Default Port(s) | Responsibility |
 |---|---|---|---|
-| **Metadata Server** | `metadata-server` | 9001/9002/9003 | Manages the global directory tree, file→DataNode mapping, multi-replica allocation, and DataNode registration; guarantees multi-node consistency via Raft |
-| **Data Node** | `data-node` | 9101+ | Stores actual file content to local disk; registers with MDS on startup (auto-redirects to leader); reports held paths for orphan GC |
+| **Metadata Server** | `metadata-server` | 9001/9002/9003 | Manages the global directory tree, file→DataNode mapping, multi-replica allocation, and DataNode heartbeat lifecycle; guarantees multi-node consistency via Raft |
+| **Data Node** | `data-node` | 9101+ | Stores actual file content to local disk; sends periodic heartbeats to MDS (first heartbeat = auto-registration, auto-redirects to leader); reports held paths for orphan GC |
 | **Client** | `client` | — | CLI tool; metadata operations go through MDS, data operations go MDS→DataNode; writes auto-redirect from follower to leader |
 
 ### Data Flow
 
+**PUT flow (write)** — client uploads to N replicas in parallel, then marks complete:
+
+```mermaid
+%%{init: {"themeVariables": {"fontSize": "18px"}, "flowchart": {"nodeSpacing": 50, "rankSpacing": 60}} }%%
+flowchart TD
+    P1["Client"] -->|"1. RPC"| P2["MDS Leader<br/>create metadata (status=pending)<br/>select N DataNodes"]
+    P2 -->|"2. return N addresses"| P3["Client"]
+    P3 -->|"3. Parallel RPC"| P4["DataNodes<br/>store content to N replicas"]
+    P4 -->|"4. ack"| P5["Client"]
+    P5 -->|"5. RPC"| P6["MDS Leader<br/>mark complete: pending → complete"]
+
+    classDef client fill:#d4edda,stroke:#28a745,stroke-width:2px,color:#155724
+    classDef leader fill:#f8d7da,stroke:#dc3545,stroke-width:3px,color:#721c24
+    classDef datanode fill:#fff3cd,stroke:#ffc107,stroke-width:2px,color:#856404
+    class P1,P3,P5 client
+    class P2,P6 leader
+    class P4 datanode
 ```
-put:  Client ──RPC──→ MDS (leader creates metadata with pending status, selects N DataNodes)
-                              │
-                              ▼
-                    returns N DataNode addresses
-                              │
-                              ▼
-      Client ──Parallel RPC──→ DataNodes (store content to N replicas)
-                              │
-                              ▼
-      Client ──RPC──→ MDS (mark file complete: pending → complete)
 
-get:  Client ──RPC──→ MDS (any node looks up file location + status)
-                              │
-                              ▼
-                    if pending → return empty content directly
-                    if complete → return DataNode addresses
-                              │
-                              ▼
-      Client ──RPC──→ DataNode (reads content, tries replicas in order)
+**GET flow (read)** — pending returns empty, complete fetches from DataNode:
 
-mkdir/ls/stat/rm:  Client ──RPC──→ MDS (writes go through Raft consensus, reads served locally)
+```mermaid
+%%{init: {"themeVariables": {"fontSize": "18px"}, "flowchart": {"nodeSpacing": 50, "rankSpacing": 60}} }%%
+flowchart TD
+    G1["Client"] -->|"1. RPC"| G2["MDS (any node)<br/>lookup location + status"]
+    G2 --> G3{Status?}
+    G3 -->|pending| G4["Return empty content"]
+    G3 -->|complete| G5["Return DataNode addresses"]
+    G5 -->|"2. RPC"| G6["DataNode<br/>read content, try replicas in order"]
+
+    classDef client fill:#d4edda,stroke:#28a745,stroke-width:2px,color:#155724
+    classDef read fill:#cce5ff,stroke:#007bff,stroke-width:2px,color:#004085
+    classDef datanode fill:#fff3cd,stroke:#ffc107,stroke-width:2px,color:#856404
+    classDef decision fill:#e2d9f3,stroke:#6f42c1,stroke-width:2px,color:#4a2d8a
+    class G1 client
+    class G4,G5 read
+    class G6 datanode
+    class G3 decision
+```
+
+**Metadata ops** — writes go through Raft consensus, reads served locally:
+
+```mermaid
+%%{init: {"themeVariables": {"fontSize": "18px"}, "flowchart": {"nodeSpacing": 80, "rankSpacing": 50}} }%%
+flowchart LR
+    O1["mkdir / rm (write)"] -->|"Raft consensus"| O2["MDS Leader"]
+    O3["ls / stat (read)"] -->|"local read"| O4["MDS any node"]
+
+    classDef leader fill:#f8d7da,stroke:#dc3545,stroke-width:3px,color:#721c24
+    classDef read fill:#cce5ff,stroke:#007bff,stroke-width:2px,color:#004085
+    class O2 leader
+    class O4 read
 ```
 
 ## Core Features
@@ -104,6 +104,74 @@ CreateFile ──→ status=pending (metadata exists, no data yet)
 - **Pending files are treated as empty** by reads (like POSIX `creat()` before write), avoiding "ghost file" errors
 - **CompleteFile marks data as ready** so subsequent reads can fetch from DataNodes
 - If all uploads fail, the client performs best-effort metadata deletion to clean up
+
+### DataNode Heartbeat (Auto-Registration & Timeout Removal)
+
+The system uses a **heartbeat-based unified lifecycle** instead of a separate registration RPC: *first heartbeat registers, timeout removes*. No explicit `RegisterDataNode` call exists anymore — a DataNode simply starts sending heartbeats and lets the MDS manage its membership automatically.
+
+| Parameter | Value | Where |
+|---|---|---|
+| Heartbeat interval | 5 minutes | DataNode side (`heartbeatInterval`) |
+| Health check cycle | 5 minutes | MDS side (same as GC cycle) |
+| Heartbeat timeout | 10 minutes (2× interval) | MDS side (`heartbeatTimeout`) |
+
+#### Lifecycle Flow
+
+```mermaid
+flowchart TD
+    %% Shared Raft consensus path (outside both responsibility boxes)
+    Submit[Submit Heartbeat command<br/>via Raft consensus] --> Apply[applyHeartbeat applies state machine]
+    Apply --> Registered{Node already in<br/>dataNodes list?}
+    Registered -->|No - first heartbeat| AddNode[Auto-add to dataNodes<br/>= registration done]
+    Registered -->|Yes - already registered| UpdateTS[Update lastHeartbeat = now]
+    AddNode --> UpdateTS
+
+    subgraph DN ["DataNode"]
+        Start([DataNode starts]) --> FirstHB[Send heartbeat immediately<br/>addr = self address]
+        FirstHB --> Redirect{MDS is leader?}
+        Redirect -->|No| FollowRedirect[Follow redirect to leader<br/>up to 3 retries]
+        FollowRedirect --> FirstHB
+        Wait[Wait 5 minutes] --> PeriodicHB[Send periodic heartbeat]
+        PeriodicHB --> Redirect
+    end
+
+    subgraph GC ["MDS GC Cycle"]
+        GCStart([MDS GC cycle starts<br/>every 5 minutes]) --> HealthCheck[checkDataNodeHealth<br/>scans lastHeartbeat]
+        HealthCheck --> Timeout{No heartbeat for<br/>over 10 min?}
+        Timeout -->|Yes| RemoveSubmit[Submit RemoveDataNode command<br/>via Raft consensus]
+        RemoveSubmit --> RemoveApply[applyRemoveDataNode<br/>remove from list + clear heartbeat]
+        RemoveApply --> Dead([Node removed])
+        Timeout -->|No| KeepAlive[Keep alive]
+    end
+
+    %% Cross-boundary edges
+    Redirect -->|Yes| Submit
+    UpdateTS --> Wait
+    Dead -.->|After DataNode recovers<br/>next heartbeat| FirstHB
+
+    classDef startEnd fill:#d4edda,stroke:#28a745,stroke-width:2px
+    classDef register fill:#cce5ff,stroke:#007bff
+    classDef heartbeat fill:#fff3cd,stroke:#ffc107
+    classDef timeout fill:#f8d7da,stroke:#dc3545,stroke-width:2px
+    classDef raft fill:#e2d9f3,stroke:#6f42c1
+    class Start,Dead startEnd
+    class AddNode,Registered register
+    class FirstHB,PeriodicHB,Wait,UpdateTS heartbeat
+    class GCStart,HealthCheck,Timeout,RemoveSubmit,RemoveApply timeout
+    class Submit,RemoveSubmit raft
+
+    %% Dashed boundary boxes for responsibility separation
+    style DN stroke-dasharray: 5 5, fill:none, stroke:#007bff, stroke-width:2px
+    style GC stroke-dasharray: 5 5, fill:none, stroke:#dc3545, stroke-width:2px
+```
+
+**Key behaviors:**
+
+- **First heartbeat = auto-registration** — `applyHeartbeat` adds the node to `dataNodes` if absent, then records `lastHeartbeat`. No separate registration RPC needed.
+- **Leader redirect** — if a DataNode heartbeats a follower, it follows the redirect to the leader (up to 3 retries), reusing the same redirect mechanism as writes.
+- **Removal goes through Raft** — when the GC-cycle health check finds a node past the 10-minute timeout, it submits `OpRemoveDataNode` as a Raft command, so all replicas agree on cluster membership.
+- **Snapshot persistence** — `lastHeartbeat` is included in Raft Snapshot/Restore, so leader failover does not lose heartbeat records and cause false removals.
+- **Automatic recovery** — a removed DataNode needs no manual re-registration; its next heartbeat re-adds it to the cluster.
 
 ### Create Mode (POSIX-like)
 
@@ -190,7 +258,7 @@ go build -o bin/client ./cmd/client
 ### Client Commands
 
 ```bash
-# List registered data nodes
+# List active data nodes
 ./bin/client -mds=localhost:9001 nodes
 
 # Create a directory
@@ -234,7 +302,7 @@ file-storage/
 │   ├── metadata/
 │   │   ├── mds.go                 # MDS core: RPC handlers, StateMachine struct, snapshot
 │   │   ├── state_machine.go       # goraft StateMachine interface (Apply/Snapshot/Restore)
-│   │   ├── apply.go               # Apply internal implementations (mkdir/create/complete/delete)
+│   │   ├── apply.go               # Apply internal implementations (mkdir/create/complete/delete/heartbeat/remove_dn)
 │   │   └── gc.go                  # Background orphan data garbage collection
 │   ├── datanode/datanode.go       # DataNode core: content storage + RPC
 │   └── client/client.go           # Client logic: RPC wrapper + follower redirect
@@ -262,23 +330,25 @@ The project depends on [goraft](https://github.com/lwwgo/goraft), a standalone R
 
 2. **Raft high availability**: 3 MDS nodes form a Raft cluster, ensuring metadata consistency via goraft. Write operations go through Raft consensus replicated to a majority; read operations are served from local replicas. After leader failure, re-election happens automatically.
 
-3. **Write consensus + local reads**: Write operations (Mkdir/CreateFile/CompleteFile/Delete/RegisterDataNode) are submitted as Raft log entries by the leader, replicated to a majority, then applied to the state machine. Read operations are served directly from each node's local state machine replica for low latency.
+3. **Write consensus + local reads**: Write operations (Mkdir/CreateFile/CompleteFile/Delete/Heartbeat/RemoveDataNode) are submitted as Raft log entries by the leader, replicated to a majority, then applied to the state machine. Read operations are served directly from each node's local state machine replica for low latency.
 
-4. **Automatic follower redirect**: When a follower receives a write request, it returns `ErrNotLeader{Leader: addr}`. The client/data node automatically retries against the leader address, transparent to the user.
+4. **Heartbeat-based DataNode lifecycle**: Instead of a separate registration RPC, a DataNode's first heartbeat auto-registers it, and 10 minutes of silence auto-removes it via a Raft command. The removed node rejoins automatically on its next heartbeat — no manual intervention required. Heartbeat timestamps are part of the Raft snapshot, so leader failover never causes false removals.
 
-5. **Unified namespace**: Users see a single directory tree (e.g., `/docs/readme.md`), while the underlying files are distributed across multiple DataNodes with multi-replica copies. Clients learn file locations via MDS.
+5. **Automatic follower redirect**: When a follower receives a write request, it returns `ErrNotLeader{Leader: addr}`. The client/data node automatically retries against the leader address, transparent to the user.
 
-6. **Multi-replica storage**: Each file is replicated across multiple DataNodes (default 3) for fault tolerance. Client uploads to all replicas in parallel and reads try each replica in order.
+6. **Unified namespace**: Users see a single directory tree (e.g., `/docs/readme.md`), while the underlying files are distributed across multiple DataNodes with multi-replica copies. Clients learn file locations via MDS.
 
-7. **File lifecycle with pending/complete state**: Files start in `pending` status after metadata creation and transition to `complete` after successful data upload. Pending files return empty content on reads (like POSIX `creat()`), preventing ghost file errors.
+7. **Multi-replica storage**: Each file is replicated across multiple DataNodes (default 3) for fault tolerance. Client uploads to all replicas in parallel and reads try each replica in order.
 
-8. **Orphan data garbage collection**: Background GC periodically compares DataNode-held files against metadata tree and cleans up orphans, with a 30-second mtime safety window to prevent deleting files created during the scan. Manual `gc` command available for on-demand cleanup.
+8. **File lifecycle with pending/complete state**: Files start in `pending` status after metadata creation and transition to `complete` after successful data upload. Pending files return empty content on reads (like POSIX `creat()`), preventing ghost file errors.
 
-9. **Ghost file protection**: Three-layer defense — client compensation deletion, empty file legality for pending state, and background orphan GC.
+9. **Orphan data garbage collection**: Background GC periodically compares DataNode-held files against metadata tree and cleans up orphans, with a 30-second mtime safety window to prevent deleting files created during the scan. Manual `gc` command available for on-demand cleanup.
 
-10. **Zero third-party dependencies**: Built entirely with the Go standard library (`net/rpc`, `encoding/json`, `log/slog`), depending only on goraft (which itself has zero external dependencies). Compile and run.
+10. **Ghost file protection**: Three-layer defense — client compensation deletion, empty file legality for pending state, and background orphan GC.
 
-11. **WAL + Snapshot persistence**: Each MDS node persists Raft state via WAL + Snapshot. After restart, the state machine is restored from the Snapshot and incremental WAL logs are replayed.
+11. **Zero third-party dependencies**: Built entirely with the Go standard library (`net/rpc`, `encoding/json`, `log/slog`), depending only on goraft (which itself has zero external dependencies). Compile and run.
+
+12. **WAL + Snapshot persistence**: Each MDS node persists Raft state via WAL + Snapshot. After restart, the state machine is restored from the Snapshot and incremental WAL logs are replayed.
 
 ## Testing
 
@@ -294,7 +364,7 @@ End-to-end integration verification is primarily done via `start.sh`, covering: 
 ## Future Enhancements
 
 - **File chunking**: Split large files into chunks stored across different DataNodes for better parallel upload/download
-- **DataNode heartbeat**: MDS periodically detects DataNode liveness and automatically removes failed nodes
+- **DataNode rebalancing**: When a DataNode is removed by heartbeat timeout, automatically re-replicate its files onto remaining nodes to maintain the target replica count
 - **Strongly consistent reads**: Current reads are served from local replicas; introduce ReadIndex for linearizable reads
 - **HTTP gateway**: Add an HTTP layer in front of the client to provide a REST API
 - **Quota management**: Per-directory/user storage quotas

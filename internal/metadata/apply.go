@@ -7,13 +7,33 @@ import (
 	"github.com/lwwgo/file-storage/internal/types"
 )
 
-func (mds *MetadataServer) applyRegisterDataNode(p *commandPayload) error {
+// applyHeartbeat 处理心跳：首次心跳自动注册，后续更新最后心跳时间。
+func (mds *MetadataServer) applyHeartbeat(p *commandPayload) error {
+	// 不存在则自动加入（即注册）
+	found := false
 	for _, a := range mds.dataNodes {
 		if a == p.Addr {
-			return nil // 幂等
+			found = true
+			break
 		}
 	}
-	mds.dataNodes = append(mds.dataNodes, p.Addr)
+	if !found {
+		mds.dataNodes = append(mds.dataNodes, p.Addr)
+	}
+	// 更新心跳时间
+	mds.lastHeartbeat[p.Addr] = time.Now()
+	return nil
+}
+
+// applyRemoveDataNode 移除超时未心跳的数据节点。
+func (mds *MetadataServer) applyRemoveDataNode(p *commandPayload) error {
+	for i, a := range mds.dataNodes {
+		if a == p.Addr {
+			mds.dataNodes = append(mds.dataNodes[:i], mds.dataNodes[i+1:]...)
+			break
+		}
+	}
+	delete(mds.lastHeartbeat, p.Addr)
 	return nil
 }
 

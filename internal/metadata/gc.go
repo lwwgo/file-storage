@@ -15,6 +15,10 @@ const (
 	// GC start are skipped to avoid deleting files created during the GC scan
 	// (which may not yet appear in the validPaths snapshot).
 	gcSafetyWindow = 30 * time.Second
+
+	// heartbeatTimeout is how long without heartbeat before a DataNode is
+	// considered dead and removed from the cluster.
+	heartbeatTimeout = 10 * time.Minute
 )
 
 // startGC starts the background garbage collection goroutine.
@@ -42,6 +46,9 @@ func (mds *MetadataServer) runGC() {
 	// created during the GC scan (they may not yet be in validPaths).
 	gcStart := time.Now()
 
+	// 0. Health check: remove DataNodes that haven't heartbeat for too long
+	mds.checkDataNodeHealth()
+
 	// 1. Collect all valid file paths from metadata tree
 	validPaths := mds.collectValidPaths()
 	mds.logger.Debug("collected valid paths", "count", len(validPaths))
@@ -58,6 +65,34 @@ func (mds *MetadataServer) runGC() {
 	}
 
 	mds.logger.Debug("GC cycle finished")
+}
+
+// checkDataNodeHealth removes DataNodes whose last heartbeat exceeds the timeout.
+// Removal goes through Raft so all nodes agree on the cluster membership.
+func (mds *MetadataServer) checkDataNodeHealth() {
+	now := time.Now()
+	cutoff := now.Add(-heartbeatTimeout)
+
+	mds.mu.RLock()
+	deadNodes := make(map[string]time.Time)
+	for addr, last := range mds.lastHeartbeat {
+		if last.Before(cutoff) {
+			deadNodes[addr] = last
+		}
+	}
+	mds.mu.RUnlock()
+
+	for addr, last := range deadNodes {
+		mds.logger.Warn("data node heartbeat timeout, removing",
+			"addr", addr,
+			"last_heartbeat", last,
+			"elapsed", now.Sub(last).Round(time.Second),
+			"timeout", heartbeatTimeout)
+		payload := &commandPayload{Op: OpRemoveDataNode, Addr: addr}
+		if err := mds.submitCommand(payload); err != nil {
+			mds.logger.Warn("failed to remove dead data node via raft", "addr", addr, "error", err)
+		}
+	}
 }
 
 // collectValidPaths walks the metadata tree and returns all file paths.

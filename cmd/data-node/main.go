@@ -52,17 +52,9 @@ func main() {
 	logger.Info("data node starting", "addr", *addr, "mds", *mdsAddr, "data_dir", *dataDir)
 	fmt.Printf("Data Node listening on %s\n", *addr)
 
-	// Register with MDS (retry a few times in case MDS is not started yet)
-	go func() {
-		for i := 0; i < 5; i++ {
-			if err := dn.RegisterToMDS(); err != nil {
-				logger.Warn("failed to register to MDS, retrying...", "attempt", i+1, "error", err)
-				continue
-			}
-			return
-		}
-		logger.Error("failed to register to MDS after 5 attempts")
-	}()
+	// Start heartbeat goroutine: first heartbeat registers, periodic heartbeats keep alive.
+	// If MDS is not ready yet, the first heartbeat fails silently and retries on next tick.
+	dn.StartHeartbeat()
 
 	// Graceful shutdown
 	sigCh := make(chan os.Signal, 1)
